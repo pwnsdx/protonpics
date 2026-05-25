@@ -18,7 +18,7 @@ use crate::cli::{Cli, Command, LoginCommand, ProgressMode, SharesCommand};
 use crate::export::ExportOptions;
 use crate::progress::Mode as ProgressOutputMode;
 
-pub fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli) -> Result<i32> {
     let mut stdout = io::stdout();
     run_with_writer(
         cli,
@@ -32,7 +32,7 @@ pub fn install_signal_handler() -> Result<()> {
     signals::install()
 }
 
-fn run_with_writer<W, LF, SF>(cli: Cli, out: &mut W, login: LF, list_shares: SF) -> Result<()>
+fn run_with_writer<W, LF, SF>(cli: Cli, out: &mut W, login: LF, list_shares: SF) -> Result<i32>
 where
     W: Write,
     LF: Fn(&LoginCommand) -> Result<LoginOutput>,
@@ -68,9 +68,11 @@ where
                     report.skipped,
                 );
                 writeln!(out, "{line}")?;
+                Ok(0)
             } else {
+                let failed = report.failed_downloads.len();
                 let line = format!(
-                    "export backend={} root={} dirs={} files={} downloaded={} deleted={} skipped={}",
+                    "export backend={} root={} dirs={} files={} downloaded={} deleted={} skipped={} failed={}",
                     opened.source.backend_name(),
                     opened.source.root_id(),
                     report.listed_dirs,
@@ -78,18 +80,38 @@ where
                     report.downloaded,
                     report.deleted,
                     report.skipped,
+                    failed,
                 );
                 writeln!(out, "{line}")?;
+                if failed > 0 {
+                    writeln!(
+                        out,
+                        "{} file(s) could not be downloaded. They will be retried on the next run.",
+                        failed
+                    )?;
+                    let preview = report.failed_downloads.iter().take(20);
+                    for failure in preview {
+                        writeln!(out, "  failed: {} -- {}", failure.path, failure.error)?;
+                    }
+                    if failed > 20 {
+                        writeln!(out, "  ... and {} more", failed - 20)?;
+                    }
+                    Ok(2)
+                } else {
+                    Ok(0)
+                }
             }
         }
         Command::Login(command) => {
             let result = login(&command)?;
             writeln!(out, "credentials={}", result.credentials_path.display())?;
             print_shares(out, &result.shares)?;
+            Ok(0)
         }
         Command::Shares(command) => {
             let shares = list_shares(&command)?;
             print_shares(out, &shares)?;
+            Ok(0)
         }
         Command::State(command) => {
             let state = state::SyncState::open_existing(&command.state_db)?;
@@ -104,10 +126,9 @@ where
             writeln!(out, "root_id={root_id}")?;
             writeln!(out, "objects={}", summary.object_count)?;
             writeln!(out, "updated_unix={updated_unix}")?;
+            Ok(0)
         }
     }
-
-    Ok(())
 }
 
 fn resolve_progress_mode(mode: ProgressMode) -> ProgressOutputMode {
@@ -275,11 +296,13 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        run_with_writer(cli, &mut output, unexpected_login, unexpected_shares)?;
+        let exit_code = run_with_writer(cli, &mut output, unexpected_login, unexpected_shares)?;
+        assert_eq!(exit_code, 0, "fully successful export should exit 0");
 
         let text = String::from_utf8(output).expect("utf8");
         assert!(text.contains("export backend=manifest root=photos-root"));
         assert!(text.contains("downloaded=1"));
+        assert!(text.contains("failed=0"));
         assert_eq!(fs::read(output_dir.join("photo.jpg"))?, b"jpeg");
         assert_eq!(
             SyncState::open_existing(&state_db)?.summary()?.object_count,

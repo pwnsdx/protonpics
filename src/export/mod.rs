@@ -40,6 +40,13 @@ pub struct ExportReport {
     pub skipped: usize,
     pub would_download: usize,
     pub would_delete: usize,
+    pub failed_downloads: Vec<DownloadFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadFailure {
+    pub path: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone)]
@@ -172,7 +179,7 @@ pub fn execute(source: &dyn PhotoSource, options: &ExportOptions) -> Result<Expo
                         ("total", json!(total)),
                     ],
                 );
-                let bytes = download_one(
+                match download_one(
                     source,
                     &state,
                     &options.to_dir,
@@ -180,20 +187,42 @@ pub fn execute(source: &dyn PhotoSource, options: &ExportOptions) -> Result<Expo
                     &mut reporter,
                     index + 1,
                     total,
-                )?;
-                report.downloaded += 1;
-                reporter.event(
-                    "download",
-                    "complete",
-                    [
-                        ("backend", json!(source.backend_name())),
-                        ("path", json!(job.rel_path)),
-                        ("remote_id", json!(job.remote_id)),
-                        ("bytes", json!(bytes)),
-                        ("index", json!(index + 1)),
-                        ("total", json!(total)),
-                    ],
-                );
+                ) {
+                    Ok(bytes) => {
+                        report.downloaded += 1;
+                        reporter.event(
+                            "download",
+                            "complete",
+                            [
+                                ("backend", json!(source.backend_name())),
+                                ("path", json!(job.rel_path)),
+                                ("remote_id", json!(job.remote_id)),
+                                ("bytes", json!(bytes)),
+                                ("index", json!(index + 1)),
+                                ("total", json!(total)),
+                            ],
+                        );
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        reporter.event(
+                            "download",
+                            "failed",
+                            [
+                                ("backend", json!(source.backend_name())),
+                                ("path", json!(job.rel_path)),
+                                ("remote_id", json!(job.remote_id)),
+                                ("error", json!(message.clone())),
+                                ("index", json!(index + 1)),
+                                ("total", json!(total)),
+                            ],
+                        );
+                        report.failed_downloads.push(DownloadFailure {
+                            path: job.rel_path.clone(),
+                            error: message,
+                        });
+                    }
+                }
             }
         } else {
             reporter.event(
@@ -209,7 +238,7 @@ pub fn execute(source: &dyn PhotoSource, options: &ExportOptions) -> Result<Expo
                     ),
                 ],
             );
-            report.downloaded += execute_parallel_downloads(
+            let (downloaded, failures) = execute_parallel_downloads(
                 source,
                 &state,
                 &options.to_dir,
@@ -218,6 +247,8 @@ pub fn execute(source: &dyn PhotoSource, options: &ExportOptions) -> Result<Expo
                 options.download_concurrency,
                 total_bytes,
             )?;
+            report.downloaded += downloaded;
+            report.failed_downloads.extend(failures);
         }
     }
 
@@ -271,7 +302,7 @@ fn execute_parallel_downloads(
     reporter: &mut Reporter,
     download_concurrency: usize,
     total_bytes: u64,
-) -> Result<usize> {
+) -> Result<(usize, Vec<DownloadFailure>)> {
     let total = jobs.len();
     let worker_count = download_concurrency.max(1).min(total.max(1));
     let queue = Arc::new(Mutex::new(
@@ -284,7 +315,7 @@ fn execute_parallel_downloads(
     let (tx, rx) = mpsc::channel::<WorkerEvent>();
     let root_dir = root_dir.to_path_buf();
 
-    thread::scope(|scope| -> Result<usize> {
+    thread::scope(|scope| -> Result<(usize, Vec<DownloadFailure>)> {
         for _ in 0..worker_count {
             let queue = Arc::clone(&queue);
             let cancelled = Arc::clone(&cancelled);
@@ -344,12 +375,18 @@ fn execute_parallel_downloads(
                             }
                         }
                         Err(error) => {
-                            cancelled.store(true, Ordering::Release);
-                            let _ = tx.send(WorkerEvent::Failed {
-                                path: task.job.rel_path,
-                                error: error.to_string(),
-                            });
-                            break;
+                            // Per-file failure: report it and keep working on
+                            // the rest of the queue. Other workers are not
+                            // cancelled so the batch can finish what it can.
+                            if tx
+                                .send(WorkerEvent::Failed {
+                                    path: task.job.rel_path,
+                                    error: format!("{error:#}"),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                 }
@@ -360,7 +397,7 @@ fn execute_parallel_downloads(
         let mut completed = 0usize;
         let mut completed_bytes = 0u64;
         let mut active_bytes = HashMap::<String, u64>::new();
-        let mut first_error = None::<anyhow::Error>;
+        let mut failures: Vec<DownloadFailure> = Vec::new();
         while let Ok(event) = rx.recv() {
             match event {
                 WorkerEvent::Progress { path, bytes, size } => {
@@ -419,32 +456,39 @@ fn execute_parallel_downloads(
                 }
                 WorkerEvent::Failed { path, error } => {
                     active_bytes.remove(&path);
-                    if first_error.is_none() {
-                        first_error = Some(anyhow!("download {path} failed: {error}"));
-                    }
+                    reporter.event(
+                        "download",
+                        "failed",
+                        [
+                            ("backend", json!(source.backend_name())),
+                            ("path", json!(path.clone())),
+                            ("error", json!(error.clone())),
+                            ("total", json!(total)),
+                        ],
+                    );
+                    failures.push(DownloadFailure { path, error });
                 }
             }
         }
 
-        if first_error.is_none() {
-            reporter.event(
-                "download_batch",
-                "complete",
-                [
-                    ("backend", json!(source.backend_name())),
-                    ("completed_files", json!(completed)),
-                    ("total_files", json!(total)),
-                    ("completed_bytes", json!(completed_bytes)),
-                    ("total_bytes", json!(total_bytes)),
-                ],
-            );
-        }
+        // Keep `cancelled` in scope: it would be used for interruption signals
+        // in a future change. For now it stays false through normal runs.
+        let _ = &cancelled;
 
-        if let Some(error) = first_error {
-            return Err(error);
-        }
+        reporter.event(
+            "download_batch",
+            "complete",
+            [
+                ("backend", json!(source.backend_name())),
+                ("completed_files", json!(completed)),
+                ("total_files", json!(total)),
+                ("failed_files", json!(failures.len())),
+                ("completed_bytes", json!(completed_bytes)),
+                ("total_bytes", json!(total_bytes)),
+            ],
+        );
 
-        Ok(completed)
+        Ok((completed, failures))
     })
 }
 
@@ -1028,10 +1072,20 @@ mod tests {
         ];
 
         let mut reporter = Reporter::stderr(Mode::Quiet);
-        let error =
-            execute_parallel_downloads(&source, &state, &output_dir, &jobs, &mut reporter, 2, 9)
-                .expect_err("parallel failure should bubble up");
-        assert!(error.to_string().contains("download missing.jpg failed"));
+        let (downloaded, failures) =
+            execute_parallel_downloads(&source, &state, &output_dir, &jobs, &mut reporter, 2, 9)?;
+        assert_eq!(downloaded, 1, "the healthy file must still complete");
+        assert_eq!(failures.len(), 1, "the bad file must be reported");
+        let failure = &failures[0];
+        assert_eq!(failure.path, "missing.jpg");
+        assert!(
+            failure.error.contains("unknown file file-missing"),
+            "unexpected error message: {}",
+            failure.error
+        );
+        // The healthy file should have made it to the on-disk state too,
+        // so a rerun would skip it.
+        assert!(state.get_object("ok.jpg")?.is_some());
         Ok(())
     }
 
@@ -1388,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_propagates_open_file_errors() {
+    fn execute_collects_open_file_errors_into_report() {
         let temp_dir = TempDir::new().expect("tempdir");
         let source = MemorySource {
             root_id: "root".to_owned(),
@@ -1404,7 +1458,7 @@ mod tests {
             open_error: Some("boom".to_owned()),
         };
 
-        let error = execute(
+        let report = execute(
             &source,
             &ExportOptions {
                 to_dir: temp_dir.path().join("out"),
@@ -1415,9 +1469,17 @@ mod tests {
                 progress_mode: Mode::Quiet,
             },
         )
-        .expect_err("open_file should fail");
+        .expect("execute should succeed even when one file fails");
 
-        assert!(error.to_string().contains("open remote file"));
+        assert_eq!(report.downloaded, 0);
+        assert_eq!(report.failed_downloads.len(), 1);
+        let failure = &report.failed_downloads[0];
+        assert_eq!(failure.path, "photo.jpg");
+        assert!(
+            failure.error.contains("open remote file"),
+            "unexpected failure message: {}",
+            failure.error
+        );
     }
 
     #[test]
