@@ -4746,20 +4746,20 @@ mod tests {
         ShareInfo, SrpAuth, TREE_CACHE_VERSION, TWO_FA_FIDO2, TWO_FA_TOTP, TreeCacheSnapshot,
         TreeLoadRequest, apply_share_name_suffix, bcrypt_hash, biguint_from_le,
         can_fallback_to_volume_child_listing, complete_login, configured_accounts_dir, count_index,
-        default_login_credentials_path, default_tree_cache_path, derive_salted_key_pass,
-        empty_credentials, find_share_by_name, from_args, handle_human_verification_connection,
-        hash_password, human_verification_proxy_base_url, inferred_session_email, list_shares,
-        list_shares_with_api, load_tree, login, login_with_api, mailbox_password,
-        parse_human_verification_challenge, parse_iso8601_to_ns, parse_retry_after_seconds,
-        parse_signed_modulus, parse_signed_modulus as parse_modulus, parse_xattr_payload,
-        resolve_login_command, retry_delay_for_attempt, save_tree_cache, select_session,
-        select_share, share_display_base, share_flags_label, share_state_label, share_type_label,
-        start_block_prefetch, tree_cache_matches, try_load_cached_backend, unlock_key_records,
-        validate_srp_params, verify_block_hash, with_test_accounts_dir, with_test_api_base_url,
-        with_test_browser_behavior, with_test_default_account_root,
+        decrypt_xattr_for_link, default_login_credentials_path, default_tree_cache_path,
+        derive_salted_key_pass, empty_credentials, find_share_by_name, from_args,
+        handle_human_verification_connection, hash_password, human_verification_proxy_base_url,
+        inferred_session_email, list_shares, list_shares_with_api, load_tree, login,
+        login_with_api, mailbox_password, parse_human_verification_challenge, parse_iso8601_to_ns,
+        parse_retry_after_seconds, parse_signed_modulus, parse_signed_modulus as parse_modulus,
+        parse_xattr_payload, resolve_login_command, retry_delay_for_attempt, save_tree_cache,
+        select_session, select_share, share_display_base, share_flags_label, share_state_label,
+        share_type_label, start_block_prefetch, tree_cache_matches, try_load_cached_backend,
+        unlock_key_records, validate_srp_params, verify_block_hash, with_test_accounts_dir,
+        with_test_api_base_url, with_test_browser_behavior, with_test_default_account_root,
         with_test_human_verification_answer, with_test_prompt_confirm, with_test_prompt_secrets,
         with_test_prompt_selection, with_test_prompt_texts, with_test_srp_client_secret,
-        write_human_verification_response,
+        write_human_verification_response, xattr_debug_enabled, xattr_debug_max_lines,
     };
     use crate::accounts;
     use crate::backend::PhotoSource;
@@ -9349,5 +9349,132 @@ mod tests {
             "decrypt + decompress should yield plaintext"
         );
         Ok(())
+    }
+
+    /// Helper: build a minimal `ApiLink` with the bare fields needed by
+    /// `decrypt_xattr_for_link`. The other fields are placeholders since
+    /// the function under test only inspects `link_id`, `name`, and
+    /// `xattr`.
+    fn link_with_xattr(xattr: Option<&str>) -> ApiLink {
+        ApiLink {
+            link_id: "test-link".to_owned(),
+            link_type: LINK_TYPE_FILE,
+            name: "encrypted-name".to_owned(),
+            size: 0,
+            link_state: LINK_STATE_ACTIVE,
+            modify_time: 0,
+            node_key: String::new(),
+            node_passphrase: String::new(),
+            file_properties: None,
+            xattr: xattr.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn decrypt_xattr_returns_empty_when_field_is_absent() {
+        let ring = SecretKeyRing { keys: Vec::new() };
+        let link = link_with_xattr(None);
+        let parsed = decrypt_xattr_for_link(&link, &ring);
+        assert!(parsed.modification_time_ns.is_none());
+        assert!(parsed.capture_time_ns.is_none());
+        assert!(parsed.sha1.is_none());
+    }
+
+    #[test]
+    fn decrypt_xattr_returns_empty_when_field_is_blank() {
+        let ring = SecretKeyRing { keys: Vec::new() };
+        let link = link_with_xattr(Some("   \n  "));
+        let parsed = decrypt_xattr_for_link(&link, &ring);
+        assert!(parsed.modification_time_ns.is_none());
+        assert!(parsed.capture_time_ns.is_none());
+        assert!(parsed.sha1.is_none());
+    }
+
+    #[test]
+    fn decrypt_xattr_returns_empty_when_payload_cannot_be_decrypted() -> Result<()> {
+        // A real PGP message wrapper that the ring cannot unlock: encrypted
+        // for a different keyring entirely.
+        let (_secret_a, public_a) = generate_fixture_key("A <a@example.com>")?;
+        let (secret_b, _public_b) = generate_fixture_key("B <b@example.com>")?;
+        let wrong_ring = SecretKeyRing::from_armored_secret(&secret_b, b"")?;
+
+        let armored = encrypt_armored_message(&public_a, b"unreachable")?;
+        let link = link_with_xattr(Some(&armored));
+        let parsed = decrypt_xattr_for_link(&link, &wrong_ring);
+        assert!(parsed.modification_time_ns.is_none());
+        assert!(parsed.capture_time_ns.is_none());
+        assert!(parsed.sha1.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn decrypt_xattr_extracts_timestamps_from_real_compressed_payload() -> Result<()> {
+        // Simulate exactly what Proton ships: a Compressed Data Packet
+        // wrapping a JSON payload with the expected schema, then encrypted
+        // with the file's node key.
+        let (secret_armored, public_key) = generate_fixture_key("File <f@example.com>")?;
+        let ring = SecretKeyRing::from_armored_secret(&secret_armored, b"")?;
+
+        let json = r#"{"Common":{"ModificationTime":"2024-08-15T14:32:00.000Z","Size":1000,"Digests":{"SHA1":"deadbeef"}},"Camera":{"CaptureTime":"2024-08-15T14:00:00Z"}}"#;
+        let armored = encrypt_compressed_armored_message(&public_key, json.as_bytes())?;
+        let link = link_with_xattr(Some(&armored));
+
+        let parsed = decrypt_xattr_for_link(&link, &ring);
+        assert_eq!(
+            parsed.modification_time_ns,
+            Some(1_723_732_320_000_000_000)
+        );
+        assert_eq!(
+            parsed.capture_time_ns,
+            Some(1_723_730_400_000_000_000)
+        );
+        assert_eq!(parsed.sha1.as_deref(), Some("deadbeef"));
+        Ok(())
+    }
+
+    /// `xattr_debug_enabled` and `xattr_debug_max_lines` are read from the
+    /// process environment, so we serialize their tests inside a single
+    /// test to avoid races between the shared env var.
+    #[test]
+    fn xattr_debug_helpers_read_environment_variables() {
+        // SAFETY: env mutation is process-wide. We restore prior values to
+        // limit blast radius. Other XAttr tests do not depend on these
+        // variables being set.
+        let prior_enabled = std::env::var("PROTONPICS_DEBUG_XATTR").ok();
+        let prior_max = std::env::var("PROTONPICS_DEBUG_XATTR_MAX").ok();
+
+        unsafe { std::env::remove_var("PROTONPICS_DEBUG_XATTR") };
+        assert!(!xattr_debug_enabled(), "unset env should disable debug mode");
+
+        unsafe { std::env::set_var("PROTONPICS_DEBUG_XATTR", "0") };
+        assert!(!xattr_debug_enabled(), "0 should disable debug mode");
+
+        unsafe { std::env::set_var("PROTONPICS_DEBUG_XATTR", "1") };
+        assert!(xattr_debug_enabled(), "1 should enable debug mode");
+
+        unsafe { std::env::set_var("PROTONPICS_DEBUG_XATTR", "yes") };
+        assert!(xattr_debug_enabled(), "yes should enable debug mode");
+
+        unsafe { std::env::set_var("PROTONPICS_DEBUG_XATTR", "true") };
+        assert!(xattr_debug_enabled(), "true should enable debug mode");
+
+        unsafe { std::env::remove_var("PROTONPICS_DEBUG_XATTR_MAX") };
+        assert_eq!(xattr_debug_max_lines(), 50, "default cap is 50");
+
+        unsafe { std::env::set_var("PROTONPICS_DEBUG_XATTR_MAX", "garbage") };
+        assert_eq!(xattr_debug_max_lines(), 50, "non-numeric falls back to 50");
+
+        unsafe { std::env::set_var("PROTONPICS_DEBUG_XATTR_MAX", "  17 ") };
+        assert_eq!(xattr_debug_max_lines(), 17, "trimmed numeric value is read");
+
+        // Restore.
+        match prior_enabled {
+            Some(value) => unsafe { std::env::set_var("PROTONPICS_DEBUG_XATTR", value) },
+            None => unsafe { std::env::remove_var("PROTONPICS_DEBUG_XATTR") },
+        }
+        match prior_max {
+            Some(value) => unsafe { std::env::set_var("PROTONPICS_DEBUG_XATTR_MAX", value) },
+            None => unsafe { std::env::remove_var("PROTONPICS_DEBUG_XATTR_MAX") },
+        }
     }
 }
