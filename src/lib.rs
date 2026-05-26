@@ -295,7 +295,7 @@ mod tests {
     }}
   ]
 }}"#,
-            source.display(),
+            crate::paths::path_to_json_string(&source),
         );
         fs::write(&manifest, manifest_json)?;
         Ok(manifest)
@@ -818,7 +818,7 @@ mod tests {
       "modified_at_ns": 1700000000000000000,
       "source_path": "{source_path}"
     }}"#,
-                source_path = source.display(),
+                source_path = crate::paths::path_to_json_string(&source),
             ));
         }
         let manifest = temp_dir.path().join("manifest.json");
@@ -920,8 +920,8 @@ mod tests {
     }}
   ]
 }}"#,
-            healthy.display(),
-            bad.display(),
+            crate::paths::path_to_json_string(&healthy),
+            crate::paths::path_to_json_string(&bad),
         );
         fs::write(&manifest, manifest_json)?;
 

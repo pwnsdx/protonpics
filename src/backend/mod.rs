@@ -100,7 +100,7 @@ mod tests {
     }}
   ]
 }}"#,
-            source.display(),
+            crate::paths::path_to_json_string(&source),
         );
         fs::write(&manifest, manifest_json)?;
 

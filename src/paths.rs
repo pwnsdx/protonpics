@@ -114,10 +114,32 @@ pub fn disambiguated_name(seen: &mut HashMap<String, usize>, name: &str, id: &st
         return base;
     }
 
-    if id.is_empty() {
-        format!("{base}_{count}")
+    let suffix = if id.is_empty() {
+        format!("_{count}")
     } else {
-        format!("{base}_{}", short_id(id))
+        format!("_{}", short_id(id))
+    };
+
+    insert_before_extension(&base, &suffix)
+}
+
+/// Inserts `suffix` right before the file extension so the resulting name
+/// keeps its extension and stays recognisable to the OS / Photos.app /
+/// generic media tooling. `photo.jpg` + `_12345678` becomes
+/// `photo_12345678.jpg`, not `photo.jpg_12345678`.
+///
+/// Rules:
+/// - The extension is whatever follows the *last* dot in the base name.
+/// - A dotfile-like base (no characters before the dot, e.g. `.hidden`)
+///   is treated as having no extension; the suffix is appended.
+/// - A base with no dot at all also has the suffix appended.
+/// - For multi-dot bases like `archive.tar.gz`, only the final extension
+///   is preserved (`archive.tar_<id>.gz`), since that is the segment OSes
+///   actually use for type detection.
+fn insert_before_extension(base: &str, suffix: &str) -> String {
+    match base.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}{suffix}.{ext}"),
+        _ => format!("{base}{suffix}"),
     }
 }
 
@@ -144,6 +166,20 @@ pub fn default_account_dir(email: &str) -> Result<PathBuf> {
 pub fn account_file_name(email: &str) -> String {
     let _ = email;
     "session.json".to_owned()
+}
+
+/// Converts a `Path` into a JSON-safe string literal so it can be
+/// embedded inside a JSON manifest without breaking the parser. On
+/// Windows, `Path::display()` produces backslash separators that JSON
+/// interprets as escape sequences (`\U`, `\T`, …) and rejects with
+/// "invalid escape". This helper escapes each backslash so the value
+/// round-trips through `serde_json` regardless of host platform.
+///
+/// Public so the integration test crate can use it; the function is
+/// otherwise only relevant to test fixtures that build manifests on
+/// the fly.
+pub fn path_to_json_string(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
 }
 
 #[cfg(test)]
@@ -223,9 +259,78 @@ mod tests {
             disambiguated_name(&mut seen, "photo.jpg", "abcdef012345"),
             "photo.jpg"
         );
+        // The disambiguator is inserted before the extension so the file
+        // keeps its `.jpg` suffix and stays importable by Photos.app and
+        // friends. Earlier versions emitted `photo.jpg_12345678`, which
+        // produced files with broken extensions on disk.
         assert_eq!(
             disambiguated_name(&mut seen, "photo.jpg", "1234567890ab"),
-            "photo.jpg_12345678"
+            "photo_12345678.jpg"
+        );
+    }
+
+    #[test]
+    fn disambiguated_name_inserts_suffix_before_extension_for_common_media() {
+        let mut seen = HashMap::new();
+        // First sighting is untouched.
+        assert_eq!(
+            disambiguated_name(&mut seen, "IMG_5349.PNG", "0vHscyqMabcd"),
+            "IMG_5349.PNG"
+        );
+        // Subsequent ones get the suffix between stem and extension, with
+        // the original extension casing preserved.
+        assert_eq!(
+            disambiguated_name(&mut seen, "IMG_5349.PNG", "0vHscyqMabcd"),
+            "IMG_5349_0vHscyqM.PNG"
+        );
+        assert_eq!(
+            disambiguated_name(&mut seen, "IMG_5349.PNG", "tMpZEul0xyz9"),
+            "IMG_5349_tMpZEul0.PNG"
+        );
+    }
+
+    #[test]
+    fn disambiguated_name_preserves_only_final_extension_on_multidot_names() {
+        let mut seen = HashMap::new();
+        assert_eq!(
+            disambiguated_name(&mut seen, "archive.tar.gz", "abcdef012345"),
+            "archive.tar.gz"
+        );
+        // We deliberately treat just the final segment as the extension:
+        // that is what the OS uses for type detection, and keeping the
+        // earlier dots inside the stem preserves the original name.
+        assert_eq!(
+            disambiguated_name(&mut seen, "archive.tar.gz", "1234567890ab"),
+            "archive.tar_12345678.gz"
+        );
+    }
+
+    #[test]
+    fn disambiguated_name_appends_when_there_is_no_extension() {
+        let mut seen = HashMap::new();
+        assert_eq!(
+            disambiguated_name(&mut seen, "README", "abcdef012345"),
+            "README"
+        );
+        assert_eq!(
+            disambiguated_name(&mut seen, "README", "1234567890ab"),
+            "README_12345678"
+        );
+    }
+
+    #[test]
+    fn disambiguated_name_treats_dotfiles_as_extensionless() {
+        let mut seen = HashMap::new();
+        assert_eq!(
+            disambiguated_name(&mut seen, ".hidden", "abcdef012345"),
+            ".hidden"
+        );
+        // `.hidden` has no stem before the dot, so the suffix is appended
+        // instead of splitting the name into an empty stem + "hidden"
+        // extension.
+        assert_eq!(
+            disambiguated_name(&mut seen, ".hidden", "1234567890ab"),
+            ".hidden_12345678"
         );
     }
 
@@ -237,6 +342,7 @@ mod tests {
             "file_abcdef01"
         );
         assert_eq!(disambiguated_name(&mut seen, ".", ""), "_");
+        // With no id and no extension, the counter is appended directly.
         assert_eq!(disambiguated_name(&mut seen, ".", ""), "__2");
     }
 

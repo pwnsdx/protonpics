@@ -39,7 +39,7 @@ fn write_manifest(temp_dir: &TempDir, source_name: &str, source_bytes: &[u8]) ->
     }}
   ]
 }}"#,
-            source.display(),
+            protonpics::paths::path_to_json_string(&source),
             size = source_bytes.len(),
         ),
     )?;

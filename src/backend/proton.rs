@@ -4711,7 +4711,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Shutdown, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -5162,7 +5162,17 @@ mod tests {
             response.content_type,
         )?;
         stream.write_all(&response.body)?;
-        stream.flush()
+        stream.flush()?;
+        // Send a graceful FIN before the stream is dropped. Without this,
+        // dropping the TcpStream while the client is still reading triggers
+        // a RST on Windows (Winsock os error 10053 / "connection closed
+        // before message completed"), even when the body has been fully
+        // written. The half-close lets reqwest finish reading the response
+        // body cleanly, then close its end. Errors here are best-effort:
+        // a peer that has already disconnected returns NotConnected, which
+        // is harmless for the test.
+        let _ = stream.shutdown(Shutdown::Write);
+        Ok(())
     }
 
     fn reusable_credentials() -> ReusableCredential {

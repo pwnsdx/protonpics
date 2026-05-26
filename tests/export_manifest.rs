@@ -53,8 +53,8 @@ fn export_manifest_downloads_skips_and_deletes() -> Result<()> {
     }}
   ]
 }}"#,
-            first_source.display(),
-            second_source.display(),
+            protonpics::paths::path_to_json_string(&first_source),
+            protonpics::paths::path_to_json_string(&second_source),
         ),
     )?;
 
@@ -72,10 +72,10 @@ fn export_manifest_downloads_skips_and_deletes() -> Result<()> {
     let report = execute(&backend, &options)?;
     assert_eq!(report.downloaded, 2);
     assert!(output_dir.join("2026/beach.jpg").exists());
-    assert!(output_dir.join("2026/beach.jpg_photo-b").exists());
+    assert!(output_dir.join("2026/beach_photo-b.jpg").exists());
     assert_eq!(fs::read(output_dir.join("2026/beach.jpg"))?, b"aaa");
     assert_eq!(
-        fs::read(output_dir.join("2026/beach.jpg_photo-b"))?,
+        fs::read(output_dir.join("2026/beach_photo-b.jpg"))?,
         b"bbbb"
     );
 
@@ -107,7 +107,7 @@ fn export_manifest_downloads_skips_and_deletes() -> Result<()> {
     }}
   ]
 }}"#,
-            first_source.display(),
+            protonpics::paths::path_to_json_string(&first_source),
         ),
     )?;
 
@@ -120,7 +120,7 @@ fn export_manifest_downloads_skips_and_deletes() -> Result<()> {
         },
     )?;
     assert_eq!(delete_report.deleted, 1);
-    assert!(!output_dir.join("2026/beach.jpg_photo-b").exists());
+    assert!(!output_dir.join("2026/beach_photo-b.jpg").exists());
 
     let state = SyncState::open_existing(&state_db)?;
     let summary = state.summary()?;

@@ -268,7 +268,7 @@ mod tests {
     }}
   ]
 }}"#,
-            source.display(),
+            crate::paths::path_to_json_string(&source),
         );
         let manifest = write_manifest(&temp_dir, &manifest_json)?;
 
@@ -300,7 +300,7 @@ mod tests {
     }}
   ]
 }}"#,
-            source.display(),
+            crate::paths::path_to_json_string(&source),
         );
         let manifest = write_manifest(&temp_dir, &manifest_json)?;
 
@@ -371,8 +371,8 @@ mod tests {
     }}
   ]
 }}"#,
-            first.display(),
-            second.display(),
+            crate::paths::path_to_json_string(&first),
+            crate::paths::path_to_json_string(&second),
         );
         let manifest = write_manifest(&temp_dir, &manifest_json)?;
 
@@ -401,7 +401,7 @@ mod tests {
     }}
   ]
 }}"#,
-            source.display(),
+            crate::paths::path_to_json_string(&source),
         );
         let manifest = write_manifest(&temp_dir, &manifest_json)?;
 
@@ -430,7 +430,7 @@ mod tests {
     }}
   ]
 }}"#,
-            source.display(),
+            crate::paths::path_to_json_string(&source),
         );
         let manifest = write_manifest(&temp_dir, &manifest_json)?;
 

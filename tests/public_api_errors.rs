@@ -42,7 +42,7 @@ fn write_manifest(
     }}
   ]
 }}"#,
-            source.display(),
+            protonpics::paths::path_to_json_string(&source),
             size = source_bytes.len(),
         ),
     )?;

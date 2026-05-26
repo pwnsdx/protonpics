@@ -1809,8 +1809,12 @@ mod tests {
 
     #[test]
     fn system_time_to_ns_and_same_second_cover_edge_cases() -> Result<()> {
-        let time = UNIX_EPOCH + Duration::new(12, 345);
-        assert_eq!(system_time_to_ns(time)?, 12_000_000_345);
+        // Windows clamps SystemTime to FILETIME's 100ns resolution, so we
+        // cannot construct a SystemTime carrying a sub-100ns nanosecond
+        // component and expect it back verbatim. Pick values that align
+        // with that resolution so the test is identical on every platform.
+        let time = UNIX_EPOCH + Duration::new(12, 300);
+        assert_eq!(system_time_to_ns(time)?, 12_000_000_300);
         assert!(same_modified_second(1_999_999_999, 1_000_000_000));
         assert!(!same_modified_second(2_000_000_000, 1_000_000_000));
 
