@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.3 - 2026-05-26
+
+Fix the metadata-restoration pipeline shipped in 0.1.2.
+
+### Fixed
+
+- **XAttr decryption now walks into compressed payloads.** Proton clients ship the per-file `XAttr` blob wrapped in a Compressed Data Packet (zlib), then encrypted. The 0.1.2 decryption helper called `Message::decrypt` and read the result directly, which returned raw deflate bytes that failed the `String::from_utf8` check inside `decrypt_text`. Every file silently fell through to the upload-time fallback, leaving `original_modified_at_ns` and `capture_time_ns` `NULL` in the state DB and the on-disk timestamps unchanged. The fix is a single `.decompress()` call in `SecretKeyRing::decrypt_armored_message`, which is a no-op when the inner packet is already a Literal Data Packet.
+
+### How To Recover
+
+If you ran 0.1.2 and your timestamps are still wrong:
+
+```bash
+# 1. Re-run export. Existing files are skipped, but the state DB is now
+#    populated with the decrypted timestamps for every file.
+protonpics export --to ./photos proton
+
+# 2. Apply those timestamps in place. No re-download.
+protonpics repair-metadata --to ./photos
+```
+
+### Tests
+
+- New regression test `decrypt_armored_message_walks_into_compressed_payload` constructs a PGP message wrapped in `CompressionAlgorithm::ZLIB`, encrypts it, and asserts that `decrypt_armored_message` returns the inner plaintext. This locks the bug down so it cannot regress silently again.
+
 ## 0.1.2 - 2026-05-26
 
 Restores original photo timestamps. Files exported from Proton Photos used to land on disk with the upload timestamp, not the timestamp the user actually had locally before uploading. This release fixes that.
