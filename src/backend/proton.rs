@@ -7207,10 +7207,16 @@ mod tests {
 
     #[test]
     fn tree_cache_helpers_cover_paths_and_match_rules() {
+        // Build expected paths via PathBuf::join so the test runs identically
+        // on Windows (where `\` is the native separator) and Unix (where `/` is).
         let session_path = PathBuf::from("/tmp/cached@example.com/session.json");
+        let session_dir = session_path
+            .parent()
+            .expect("session has a parent")
+            .to_path_buf();
         assert_eq!(
             default_tree_cache_path(&session_path),
-            PathBuf::from("/tmp/cached@example.com/proton-tree-cache.json")
+            session_dir.join("proton-tree-cache.json")
         );
         assert_eq!(
             inferred_session_email(&session_path),

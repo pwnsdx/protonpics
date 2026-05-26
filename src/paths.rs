@@ -15,11 +15,87 @@ pub fn join_rel_path(parent: &str, child: &str) -> String {
 
 pub fn sanitize_segment(name: &str) -> String {
     let trimmed = name.trim();
-    let sanitized = trimmed.replace('\0', "").replace(['/', '\\'], "_");
+    let mut sanitized: String = trimmed
+        .chars()
+        .filter_map(|ch| {
+            if ch == '\0' {
+                // Drop NUL bytes outright. They are illegal in path segments
+                // on every platform we target.
+                None
+            } else if matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                // Replace path separators and the characters Windows
+                // forbids in file names. Doing this on every platform keeps
+                // a Mac/Linux export portable to Windows and back without
+                // round-trip surprises.
+                Some('_')
+            } else if (ch as u32) < 0x20 {
+                // Drop ASCII control characters; NTFS rejects them and
+                // they cannot meaningfully appear in real photo names.
+                None
+            } else {
+                Some(ch)
+            }
+        })
+        .collect();
+
+    // Windows refuses trailing dots or spaces in path segments, and a few
+    // base names are reserved as legacy device aliases (CON, PRN, AUX, NUL,
+    // COM1-9, LPT1-9). Make those safe for everyone so a library exported
+    // on macOS can be moved to a Windows machine without losing files.
+    while sanitized.ends_with('.') || sanitized.ends_with(' ') {
+        sanitized.pop();
+    }
+    if let Some(escaped) = escape_reserved_windows_basename(&sanitized) {
+        sanitized = escaped;
+    }
+
     match sanitized.as_str() {
         "" | "." | ".." => "_".to_owned(),
         _ => sanitized,
     }
+}
+
+/// Returns a Windows-safe variant of `name` if its base stem matches one
+/// of the legacy device aliases (CON, PRN, AUX, NUL, COM1-9, LPT1-9). The
+/// trailing underscore is inserted right after the stem so the file
+/// extension is preserved: `CON.jpg` becomes `CON_.jpg`, not `CON.jpg_`.
+fn escape_reserved_windows_basename(name: &str) -> Option<String> {
+    let stem_end = name.find('.').unwrap_or(name.len());
+    let stem = &name[..stem_end];
+    let upper = stem.to_ascii_uppercase();
+    let is_reserved = matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if !is_reserved {
+        return None;
+    }
+    let mut escaped = String::with_capacity(name.len() + 1);
+    escaped.push_str(stem);
+    escaped.push('_');
+    escaped.push_str(&name[stem_end..]);
+    Some(escaped)
 }
 
 pub fn short_id(id: &str) -> String {
@@ -84,6 +160,53 @@ mod tests {
     #[test]
     fn sanitize_segment_replaces_path_separators() {
         assert_eq!(sanitize_segment(" a/b\\c "), "a_b_c");
+        assert_eq!(sanitize_segment("a/b\\c\0"), "a_b_c");
+    }
+
+    #[test]
+    fn sanitize_segment_replaces_windows_forbidden_characters() {
+        // The full set of Windows-illegal characters in NTFS file names.
+        assert_eq!(sanitize_segment("a:b"), "a_b");
+        assert_eq!(sanitize_segment("a*b"), "a_b");
+        assert_eq!(sanitize_segment("a?b"), "a_b");
+        assert_eq!(sanitize_segment("a\"b"), "a_b");
+        assert_eq!(sanitize_segment("a<b"), "a_b");
+        assert_eq!(sanitize_segment("a>b"), "a_b");
+        assert_eq!(sanitize_segment("a|b"), "a_b");
+    }
+
+    #[test]
+    fn sanitize_segment_drops_ascii_control_characters() {
+        assert_eq!(sanitize_segment("a\x01b\x07c"), "abc");
+    }
+
+    #[test]
+    fn sanitize_segment_strips_trailing_dots_and_spaces() {
+        assert_eq!(sanitize_segment("photo."), "photo");
+        assert_eq!(sanitize_segment("photo "), "photo");
+        assert_eq!(sanitize_segment("photo..."), "photo");
+        assert_eq!(sanitize_segment("photo. ."), "photo");
+    }
+
+    #[test]
+    fn sanitize_segment_escapes_reserved_windows_basenames() {
+        assert_eq!(sanitize_segment("CON"), "CON_");
+        assert_eq!(sanitize_segment("con"), "con_");
+        assert_eq!(sanitize_segment("nul"), "nul_");
+        assert_eq!(sanitize_segment("CON.jpg"), "CON_.jpg");
+        assert_eq!(sanitize_segment("LPT1"), "LPT1_");
+        assert_eq!(sanitize_segment("COM5.txt"), "COM5_.txt");
+        // Names that merely contain a reserved alias are fine.
+        assert_eq!(sanitize_segment("CONversation.jpg"), "CONversation.jpg");
+        assert_eq!(sanitize_segment("MyCON"), "MyCON");
+    }
+
+    #[test]
+    fn sanitize_segment_replaces_dot_only_and_empty_with_underscore() {
+        assert_eq!(sanitize_segment(""), "_");
+        assert_eq!(sanitize_segment("."), "_");
+        assert_eq!(sanitize_segment(".."), "_");
+        assert_eq!(sanitize_segment("   "), "_");
     }
 
     #[test]
