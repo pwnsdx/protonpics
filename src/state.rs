@@ -345,7 +345,185 @@ mod tests {
         let error = SyncState::open_existing(&state_db)
             .err()
             .expect("schema mismatch should fail");
-        assert!(error.to_string().contains("schema_version"));
+        let message = error.to_string();
+        assert!(
+            message.contains("newer than supported"),
+            "expected newer-than-supported error, got: {message}"
+        );
+        Ok(())
+    }
+
+    /// Build an authentic v1 SQLite file (no migration columns) and confirm
+    /// `SyncState::open` walks it forward to the current schema in place,
+    /// without losing any prior data, and that the new fields default to NULL.
+    #[test]
+    fn open_migrates_v1_database_forward_in_place() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let state_db = temp_dir.path().join("state.sqlite");
+
+        // Stand up a v1 schema by hand so we cannot accidentally pick up
+        // future columns from `INIT_SQL`.
+        let connection = Connection::open(&state_db)?;
+        const V1_SCHEMA_SQL: &str = r#"
+            CREATE TABLE sync_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version INTEGER NOT NULL,
+                backend_name TEXT,
+                root_id TEXT,
+                updated_unix INTEGER
+            );
+            CREATE TABLE objects (
+                path TEXT PRIMARY KEY,
+                remote_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0,
+                modified_at_ns INTEGER NOT NULL DEFAULT 0,
+                sha1 TEXT,
+                downloaded_unix INTEGER
+            );
+            "#;
+        connection.execute_batch(V1_SCHEMA_SQL)?;
+        connection.execute(
+            "INSERT INTO sync_state (id, schema_version, updated_unix) VALUES (1, 1, 0)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO objects (path, remote_id, revision_id, size, modified_at_ns, sha1) \
+             VALUES ('legacy.jpg', 'file-1', 'rev-1', 4, 1700000000000000000, 'abc')",
+            [],
+        )?;
+        drop(connection);
+
+        // Open through the public API: this triggers `migrate_to_current`.
+        let state = SyncState::open(&state_db)?;
+
+        // The legacy row must still be there, with the two new columns
+        // surfaced as None and the rest of the metadata unchanged.
+        let stored = state
+            .get_object("legacy.jpg")?
+            .expect("legacy row must survive migration");
+        assert_eq!(stored.remote_id, "file-1");
+        assert_eq!(stored.revision_id, "rev-1");
+        assert_eq!(stored.size, 4);
+        assert_eq!(stored.modified_at_ns, 1_700_000_000_000_000_000);
+        assert_eq!(stored.sha1.as_deref(), Some("abc"));
+        assert_eq!(stored.original_modified_at_ns, None);
+        assert_eq!(stored.capture_time_ns, None);
+
+        // schema_version must be bumped to the current value.
+        let connection = Connection::open(&state_db)?;
+        let observed: i64 = connection.query_row(
+            "SELECT schema_version FROM sync_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(observed, SCHEMA_VERSION);
+
+        // The new columns must exist and accept inserts.
+        state.upsert_object(&StoredObject {
+            path: "fresh.jpg".to_owned(),
+            remote_id: "file-2".to_owned(),
+            revision_id: "rev-2".to_owned(),
+            size: 5,
+            modified_at_ns: 1_800_000_000_000_000_000,
+            sha1: None,
+            original_modified_at_ns: Some(1_500_000_000_000_000_000),
+            capture_time_ns: Some(1_400_000_000_000_000_000),
+        })?;
+        let fresh = state
+            .get_object("fresh.jpg")?
+            .expect("fresh row must round-trip");
+        assert_eq!(
+            fresh.original_modified_at_ns,
+            Some(1_500_000_000_000_000_000)
+        );
+        assert_eq!(fresh.capture_time_ns, Some(1_400_000_000_000_000_000));
+        Ok(())
+    }
+
+    /// Re-opening an already-migrated database must be a no-op. This guards
+    /// `add_column_if_missing` against duplicating columns when the
+    /// migration path is run more than once for any reason.
+    #[test]
+    fn open_is_idempotent_on_already_migrated_database() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let state_db = temp_dir.path().join("state.sqlite");
+
+        // First open: fresh init at the current schema version.
+        let state = SyncState::open(&state_db)?;
+        state.update_run_state("manifest", "root")?;
+        state.upsert_object(&StoredObject {
+            path: "photo.jpg".to_owned(),
+            remote_id: "file-1".to_owned(),
+            revision_id: "rev-1".to_owned(),
+            size: 4,
+            modified_at_ns: 1,
+            sha1: None,
+            original_modified_at_ns: Some(2),
+            capture_time_ns: Some(3),
+        })?;
+        drop(state);
+
+        // Second open: must not create duplicate columns or throw.
+        let reopened = SyncState::open(&state_db)?;
+        let summary = reopened.summary()?;
+        assert_eq!(summary.object_count, 1);
+
+        // Third open via open_existing: same expectation.
+        let again = SyncState::open_existing(&state_db)?;
+        let stored = again
+            .get_object("photo.jpg")?
+            .expect("row must survive re-open");
+        assert_eq!(stored.original_modified_at_ns, Some(2));
+        assert_eq!(stored.capture_time_ns, Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn list_objects_returns_full_rows_in_definition_order_independent_of_insertion_order()
+    -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let state = SyncState::open(&temp_dir.path().join("state.sqlite"))?;
+        state.upsert_object(&StoredObject {
+            path: "b.jpg".to_owned(),
+            remote_id: "file-b".to_owned(),
+            revision_id: "rev-b".to_owned(),
+            size: 2,
+            modified_at_ns: 200,
+            sha1: Some("bbb".to_owned()),
+            original_modified_at_ns: Some(100),
+            capture_time_ns: None,
+        })?;
+        state.upsert_object(&StoredObject {
+            path: "a.jpg".to_owned(),
+            remote_id: "file-a".to_owned(),
+            revision_id: "rev-a".to_owned(),
+            size: 1,
+            modified_at_ns: 100,
+            sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: Some(50),
+        })?;
+
+        let mut listed = state.list_objects()?;
+        listed.sort_by(|left, right| left.path.cmp(&right.path));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].path, "a.jpg");
+        assert_eq!(listed[0].remote_id, "file-a");
+        assert_eq!(listed[0].capture_time_ns, Some(50));
+        assert!(listed[0].original_modified_at_ns.is_none());
+        assert_eq!(listed[1].path, "b.jpg");
+        assert_eq!(listed[1].sha1.as_deref(), Some("bbb"));
+        assert_eq!(listed[1].original_modified_at_ns, Some(100));
+        assert!(listed[1].capture_time_ns.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn list_objects_returns_empty_for_fresh_database() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let state = SyncState::open(&temp_dir.path().join("state.sqlite"))?;
+        assert!(state.list_objects()?.is_empty());
         Ok(())
     }
 

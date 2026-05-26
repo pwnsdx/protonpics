@@ -853,6 +853,14 @@ fn set_mtime_ns(path: &Path, modified_at_ns: i64) -> Result<()> {
         .with_context(|| format!("set mtime on {}", path.display()))
 }
 
+#[cfg(test)]
+pub(crate) fn tests_helpers_set_mtime_for_lib_tests(
+    path: &Path,
+    modified_at_ns: i64,
+) -> Result<()> {
+    set_mtime_ns(path, modified_at_ns)
+}
+
 /// Resolves the best mtime to apply for a remote file. Prefers the original
 /// modification time decrypted from the Proton XAttr (the user's local mtime
 /// at upload time), falling back to the upload time when XAttr is missing or
@@ -966,6 +974,11 @@ fn system_time_to_ns(value: SystemTime) -> Result<i64> {
     let seconds = i128::from(duration.as_secs());
     let nanos = i128::from(duration.subsec_nanos());
     i64::try_from(seconds * 1_000_000_000 + nanos).context("nanosecond timestamp overflow")
+}
+
+#[cfg(test)]
+pub(crate) fn tests_helpers_system_time_to_ns(value: SystemTime) -> Result<i64> {
+    system_time_to_ns(value)
 }
 
 fn same_modified_second(lhs_ns: i64, rhs_ns: i64) -> bool {
