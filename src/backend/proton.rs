@@ -9420,14 +9420,8 @@ mod tests {
         let link = link_with_xattr(Some(&armored));
 
         let parsed = decrypt_xattr_for_link(&link, &ring);
-        assert_eq!(
-            parsed.modification_time_ns,
-            Some(1_723_732_320_000_000_000)
-        );
-        assert_eq!(
-            parsed.capture_time_ns,
-            Some(1_723_730_400_000_000_000)
-        );
+        assert_eq!(parsed.modification_time_ns, Some(1_723_732_320_000_000_000));
+        assert_eq!(parsed.capture_time_ns, Some(1_723_730_400_000_000_000));
         assert_eq!(parsed.sha1.as_deref(), Some("deadbeef"));
         Ok(())
     }
@@ -9444,7 +9438,10 @@ mod tests {
         let prior_max = std::env::var("PROTONPICS_DEBUG_XATTR_MAX").ok();
 
         unsafe { std::env::remove_var("PROTONPICS_DEBUG_XATTR") };
-        assert!(!xattr_debug_enabled(), "unset env should disable debug mode");
+        assert!(
+            !xattr_debug_enabled(),
+            "unset env should disable debug mode"
+        );
 
         unsafe { std::env::set_var("PROTONPICS_DEBUG_XATTR", "0") };
         assert!(!xattr_debug_enabled(), "0 should disable debug mode");

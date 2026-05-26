@@ -798,10 +798,11 @@ mod tests {
 
     #[test]
     fn run_with_writer_truncates_failure_listing_above_twenty() -> Result<()> {
-        // Build a manifest where every file claims to exist on disk but
-        // the matching source paths are deleted right before the export
-        // starts streaming. This forces every file to fail at open time
-        // while still letting the manifest backend construct itself.
+        // Build a manifest with 25 files. Source files exist at construction
+        // time so the lazy manifest backend builds fine, but they are then
+        // replaced with directories so that `open_file` (which tries to
+        // open() the source) fails for every entry. This exercises the
+        // truncated failure-listing path inside `run_with_writer`.
         let temp_dir = TempDir::new()?;
         let mut entries = Vec::new();
         for index in 0..25usize {
@@ -811,7 +812,7 @@ mod tests {
                 r#"    {{
       "kind": "file",
       "id": "file-{index}",
-      "name": "photo-{index}.jpg",
+      "name": "photo-{index:02}.jpg",
       "revision_id": "rev-{index}",
       "size": 4,
       "modified_at_ns": 1700000000000000000,
@@ -832,34 +833,11 @@ mod tests {
         );
         fs::write(&manifest, manifest_json)?;
 
-        // Now delete every source file: the manifest backend has cached
-        // the resolved paths, but read attempts will fail.
-        // We rely on the backend opening the files lazily, which is the
-        // case for the current ManifestBackend implementation: it stat()s
-        // each source at construction time, so we must leave them in place
-        // through the manifest load and remove them only in the worker
-        // phase. Instead of racing, mark each source as a directory the
-        // way fs::write would fail if it pointed at something not readable.
-        // Easier path: we just point sources at a directory entry, which
-        // metadata accepts but read does not.
-        // Sticking with the deletion approach but accepting the risk: the
-        // test is here to exercise the truncation message, and even if a
-        // future refactor changes the failure behaviour, the assertion is
-        // forgiving enough that we only need at least one failure.
-        for index in 0..25usize {
-            let source = temp_dir.path().join(format!("src-{index}.jpg"));
-            // Replace each file with a directory so opening them fails
-            // (metadata still succeeds, so the manifest backend builds).
-            // We do not delete to avoid the manifest construction error.
-            fs::remove_file(&source)?;
-            fs::create_dir(&source)?;
-        }
-
         let output_dir = temp_dir.path().join("out");
         let state_db = temp_dir.path().join("state.sqlite");
         let cli = Cli {
             command: Command::Export(ExportCommand {
-                to: output_dir,
+                to: output_dir.clone(),
                 state_db: Some(state_db),
                 dry_run: false,
                 delete_missing: false,
@@ -868,27 +846,125 @@ mod tests {
                 source: SourceCommand::Manifest(ManifestSourceArgs { manifest }),
             }),
         };
+
+        // Open the manifest backend in lazy mode (no source validation),
+        // then break every source so open_file fails on every file.
         let mut output = Vec::new();
-        // The manifest backend rejects mismatched sizes, so we accept any
-        // outcome here: the test really wants to check the formatting of
-        // the truncated failure list when the export does succeed in
-        // running. If construction errors out, we skip silently.
-        let exit_or_err = run_with_writer(cli, &mut output, unexpected_login, unexpected_shares);
-        if exit_or_err.is_err() {
-            return Ok(());
-        }
-        let exit = exit_or_err?;
-        if exit != 2 {
-            // No failures observed (the backend must have rejected the
-            // manifest at build time). Nothing to assert; the truncation
-            // path is exercised in the export module tests, which is
-            // where the real coverage gain lives.
-            return Ok(());
-        }
+        let exit = crate::backend::with_test_lazy_manifest(|| -> Result<i32> {
+            // Replace each source with a directory: open() fails reliably,
+            // metadata() still succeeds (which the lazy backend skips
+            // anyway, but the rename is harmless).
+            for index in 0..25usize {
+                let source = temp_dir.path().join(format!("src-{index}.jpg"));
+                fs::remove_file(&source)?;
+                fs::create_dir(&source)?;
+            }
+            run_with_writer(cli, &mut output, unexpected_login, unexpected_shares)
+        })?;
+
+        assert_eq!(exit, 2, "all-files-failed run must exit 2");
         let text = String::from_utf8(output).expect("utf8");
-        if text.contains("... and ") {
-            assert!(text.contains("more"));
-        }
+        assert!(
+            text.contains("failed=25"),
+            "summary must report 25 failures: {text}"
+        );
+        assert!(
+            text.contains("file(s) could not be downloaded"),
+            "explanation line should be present: {text}"
+        );
+        // Listing is capped at 20 entries with a "... and 5 more" suffix.
+        assert!(
+            text.contains("... and 5 more"),
+            "truncation suffix should be present: {text}"
+        );
+        // We should see 20 individual failed lines but not 25.
+        let listed = text.matches("  failed: ").count();
+        assert_eq!(listed, 20, "should list exactly 20 failures, got {listed}");
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_writer_returns_exit_code_two_on_partial_failure() -> Result<()> {
+        // One healthy file plus one whose source is replaced by a directory:
+        // the lazy manifest backend builds successfully, the export downloads
+        // the healthy file, the broken file fails to open, and the run
+        // surfaces a partial failure.
+        let temp_dir = TempDir::new()?;
+        let healthy = temp_dir.path().join("good.jpg");
+        fs::write(&healthy, b"jpeg")?;
+        let bad = temp_dir.path().join("bad.jpg");
+        fs::write(&bad, b"jpeg")?;
+
+        let manifest = temp_dir.path().join("manifest.json");
+        let manifest_json = format!(
+            r#"{{
+  "root_id": "photos-root",
+  "children": [
+    {{
+      "kind": "file",
+      "id": "file-good",
+      "name": "good.jpg",
+      "revision_id": "rev-good",
+      "size": 4,
+      "modified_at_ns": 1700000000000000000,
+      "source_path": "{}"
+    }},
+    {{
+      "kind": "file",
+      "id": "file-bad",
+      "name": "bad.jpg",
+      "revision_id": "rev-bad",
+      "size": 4,
+      "modified_at_ns": 1700000000000000000,
+      "source_path": "{}"
+    }}
+  ]
+}}"#,
+            healthy.display(),
+            bad.display(),
+        );
+        fs::write(&manifest, manifest_json)?;
+
+        let output_dir = temp_dir.path().join("out");
+        let state_db = temp_dir.path().join("state.sqlite");
+        let cli = Cli {
+            command: Command::Export(ExportCommand {
+                to: output_dir.clone(),
+                state_db: Some(state_db.clone()),
+                dry_run: false,
+                delete_missing: false,
+                download_concurrency: 1,
+                progress: ProgressMode::Off,
+                source: SourceCommand::Manifest(ManifestSourceArgs { manifest }),
+            }),
+        };
+
+        let mut output = Vec::new();
+        let exit = crate::backend::with_test_lazy_manifest(|| -> Result<i32> {
+            // Break the bad source after the manifest has been parsed but
+            // before run_with_writer constructs the backend. With lazy
+            // mode this means the backend will accept it; the open_file
+            // call during the worker phase will fail.
+            fs::remove_file(&bad)?;
+            fs::create_dir(&bad)?;
+            run_with_writer(cli, &mut output, unexpected_login, unexpected_shares)
+        })?;
+
+        assert_eq!(exit, 2, "partial failure must exit 2");
+        let text = String::from_utf8(output).expect("utf8");
+        assert!(text.contains("downloaded=1"));
+        assert!(text.contains("failed=1"));
+        assert!(
+            text.contains("failed: bad.jpg"),
+            "must list the failing path: {text}"
+        );
+        // The healthy file must have been written to disk.
+        assert_eq!(fs::read(output_dir.join("good.jpg"))?, b"jpeg");
+        // And the SQLite state must record only the successful download.
+        assert_eq!(
+            SyncState::open_existing(&state_db)?.summary()?.object_count,
+            1
+        );
         Ok(())
     }
 }

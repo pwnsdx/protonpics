@@ -43,6 +43,25 @@ enum ManifestNode {
 
 impl ManifestBackend {
     pub fn from_path(path: &Path) -> Result<Self> {
+        Self::from_path_with_options(path, ManifestLoadOptions::default())
+    }
+
+    /// Load a manifest without checking that every `source_path` exists on
+    /// disk and matches its declared size. Useful for tests that need to
+    /// observe per-file failures during the export phase rather than at
+    /// manifest construction time. Production callers should always use
+    /// [`from_path`].
+    #[cfg(test)]
+    pub fn from_path_lazy(path: &Path) -> Result<Self> {
+        Self::from_path_with_options(
+            path,
+            ManifestLoadOptions {
+                validate_sources: false,
+            },
+        )
+    }
+
+    fn from_path_with_options(path: &Path, options: ManifestLoadOptions) -> Result<Self> {
         let manifest_text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let document: ManifestDocument = serde_json::from_str(&manifest_text)
@@ -60,6 +79,7 @@ impl ManifestBackend {
             manifest_dir,
             &mut folders,
             &mut files,
+            &options,
         )?;
 
         Ok(Self {
@@ -67,6 +87,19 @@ impl ManifestBackend {
             folders,
             files,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManifestLoadOptions {
+    validate_sources: bool,
+}
+
+impl Default for ManifestLoadOptions {
+    fn default() -> Self {
+        Self {
+            validate_sources: true,
+        }
     }
 }
 
@@ -102,6 +135,7 @@ fn index_children(
     manifest_dir: &Path,
     folders: &mut HashMap<String, Vec<RemoteEntry>>,
     files: &mut HashMap<String, PathBuf>,
+    options: &ManifestLoadOptions,
 ) -> Result<()> {
     let mut entries = Vec::new();
 
@@ -112,7 +146,7 @@ fn index_children(
                     bail!("duplicate folder id {id}");
                 }
                 entries.push(RemoteEntry::folder(id.clone(), name));
-                index_children(&id, children, manifest_dir, folders, files)?;
+                index_children(&id, children, manifest_dir, folders, files, options)?;
             }
             ManifestNode::File {
                 id,
@@ -131,14 +165,17 @@ fn index_children(
                 } else {
                     manifest_dir.join(source_path)
                 };
-                let metadata = std::fs::metadata(&resolved_path)
-                    .with_context(|| format!("read metadata for {}", resolved_path.display()))?;
-                let disk_size =
-                    i64::try_from(metadata.len()).context("manifest source file size overflow")?;
-                if disk_size != size {
-                    bail!(
-                        "manifest file {id} size mismatch: metadata says {size}, disk says {disk_size}"
-                    );
+                if options.validate_sources {
+                    let metadata = std::fs::metadata(&resolved_path).with_context(|| {
+                        format!("read metadata for {}", resolved_path.display())
+                    })?;
+                    let disk_size = i64::try_from(metadata.len())
+                        .context("manifest source file size overflow")?;
+                    if disk_size != size {
+                        bail!(
+                            "manifest file {id} size mismatch: metadata says {size}, disk says {disk_size}"
+                        );
+                    }
                 }
                 if files.insert(id.clone(), resolved_path).is_some() {
                     bail!("duplicate file id {id}");
@@ -399,6 +436,53 @@ mod tests {
 
         let error = ManifestBackend::from_path(&manifest).expect_err("size mismatch");
         assert!(error.to_string().contains("size mismatch"));
+        Ok(())
+    }
+
+    /// `from_path_lazy` must accept manifests whose `source_path` does not
+    /// exist on disk. The error only surfaces later, when `open_file` is
+    /// called for that file. This is the only construction mode the
+    /// integration tests in `lib.rs` can use to drive the
+    /// "partial failure" path of the export pipeline.
+    #[test]
+    fn from_path_lazy_skips_source_validation() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let manifest_json = r#"{
+  "root_id": "root",
+  "children": [
+    {
+      "kind": "file",
+      "id": "file-1",
+      "name": "photo.jpg",
+      "revision_id": "rev-1",
+      "size": 999,
+      "modified_at_ns": 1,
+      "source_path": "/nonexistent/source.jpg"
+    }
+  ]
+}"#;
+        let manifest = write_manifest(&temp_dir, manifest_json)?;
+
+        // Eager mode rejects this manifest because the source is missing.
+        let eager_error = ManifestBackend::from_path(&manifest).expect_err("eager must fail");
+        assert!(eager_error.to_string().contains("read metadata"));
+
+        // Lazy mode accepts it.
+        let backend = ManifestBackend::from_path_lazy(&manifest)?;
+        assert_eq!(backend.root_id(), "root");
+        let listing = backend.list_children("root")?;
+        assert_eq!(listing.len(), 1);
+
+        // open_file fails as expected because the source is still missing.
+        let open_error = match backend.open_file("file-1") {
+            Ok(_) => panic!("open should fail for missing source"),
+            Err(error) => error,
+        };
+        let message = open_error.to_string();
+        assert!(
+            message.contains("open ") || message.contains("/nonexistent/source.jpg"),
+            "open error must mention the missing source: {message}"
+        );
         Ok(())
     }
 }
