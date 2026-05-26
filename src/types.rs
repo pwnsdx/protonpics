@@ -20,8 +20,21 @@ pub enum EntryKind {
 pub struct RemoteFile {
     pub revision_id: String,
     pub size: i64,
+    /// Server-side last-modified time. For Proton, this is the upload time.
+    /// Kept for backward compatibility and as a fallback when the original
+    /// metadata cannot be decrypted.
     pub modified_at_ns: i64,
     pub sha1: Option<String>,
+    /// Original file modification time, taken from the Proton XAttr blob
+    /// (`Common.ModificationTime`). Reflects the user's local mtime at the
+    /// moment of upload, which is what we want to restore on disk.
+    #[serde(default)]
+    pub original_modified_at_ns: Option<i64>,
+    /// Original capture time when the file is a photo or a video, taken
+    /// from the Proton XAttr blob (`Camera.CaptureTime`). Used to set the
+    /// macOS birthtime when available.
+    #[serde(default)]
+    pub capture_time_ns: Option<i64>,
 }
 
 impl RemoteEntry {
@@ -76,6 +89,8 @@ mod tests {
                 size: 42,
                 modified_at_ns: 99,
                 sha1: Some("abc".to_owned()),
+                original_modified_at_ns: None,
+                capture_time_ns: None,
             },
         );
         assert_eq!(entry.id, "file-1");
@@ -88,6 +103,8 @@ mod tests {
                 size: 42,
                 modified_at_ns: 99,
                 sha1: Some("abc".to_owned()),
+                original_modified_at_ns: None,
+                capture_time_ns: None,
             })
         );
     }

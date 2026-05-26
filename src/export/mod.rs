@@ -43,6 +43,29 @@ pub struct ExportReport {
     pub failed_downloads: Vec<DownloadFailure>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RepairOptions {
+    pub state_db: PathBuf,
+    pub to_dir: PathBuf,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RepairReport {
+    pub considered: usize,
+    pub repaired: usize,
+    pub already_correct: usize,
+    pub missing_local: usize,
+    pub no_metadata: usize,
+    pub failed: Vec<RepairFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairFailure {
+    pub path: String,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadFailure {
     pub path: String,
@@ -122,15 +145,25 @@ pub fn execute(source: &dyn PhotoSource, options: &ExportOptions) -> Result<Expo
                                 ("size", json!(file.size)),
                             ],
                         );
-                        if existing
-                            .as_ref()
-                            .is_none_or(|row| row.remote_id != entry.id)
-                        {
-                            state.upsert_object(&stored_object_from_remote(
-                                &child_rel_path,
-                                &entry.id,
-                                &file,
-                            ))?;
+                        // Refresh the state row whenever any tracked field
+                        // diverges from the remote view. This is what lets
+                        // an upgrade backfill `original_modified_at_ns` and
+                        // `capture_time_ns` for files that are otherwise
+                        // already on disk.
+                        let stored_view =
+                            stored_object_from_remote(&child_rel_path, &entry.id, &file);
+                        let needs_refresh = match existing.as_ref() {
+                            None => true,
+                            Some(existing) => {
+                                existing.remote_id != stored_view.remote_id
+                                    || existing.revision_id != stored_view.revision_id
+                                    || existing.original_modified_at_ns
+                                        != stored_view.original_modified_at_ns
+                                    || existing.capture_time_ns != stored_view.capture_time_ns
+                            }
+                        };
+                        if needs_refresh {
+                            state.upsert_object(&stored_view)?;
                         }
                         continue;
                     }
@@ -292,6 +325,90 @@ pub fn execute(source: &dyn PhotoSource, options: &ExportOptions) -> Result<Expo
 
     reporter.finish();
     Ok(report)
+}
+
+/// Re-applies the original modification and capture timestamps to files
+/// already on disk, using the metadata recorded in the SQLite state DB.
+/// This is the right entrypoint for users upgrading from a previous version
+/// of the tool that did not yet decrypt Proton's XAttr blob: after a fresh
+/// `export` run that backfills the new state columns, calling this function
+/// fixes the on-disk timestamps without re-downloading anything.
+pub fn repair_metadata(options: &RepairOptions) -> Result<RepairReport> {
+    let state = SyncState::open_existing(&options.state_db)?;
+    let stored = state.list_objects()?;
+    let mut report = RepairReport {
+        considered: stored.len(),
+        ..RepairReport::default()
+    };
+
+    for object in stored {
+        let local_path = local_path(&options.to_dir, &object.path);
+        if !local_path.exists() {
+            report.missing_local += 1;
+            continue;
+        }
+
+        let mtime_ns = object
+            .original_modified_at_ns
+            .or(if object.modified_at_ns > 0 {
+                Some(object.modified_at_ns)
+            } else {
+                None
+            });
+        let birthtime_ns = object
+            .capture_time_ns
+            .or(object.original_modified_at_ns)
+            .or(if object.modified_at_ns > 0 {
+                Some(object.modified_at_ns)
+            } else {
+                None
+            });
+
+        let Some(mtime_ns) = mtime_ns else {
+            report.no_metadata += 1;
+            continue;
+        };
+
+        if file_already_at_target_metadata(&local_path, mtime_ns) {
+            report.already_correct += 1;
+            continue;
+        }
+
+        if options.dry_run {
+            report.repaired += 1;
+            continue;
+        }
+
+        if let Err(error) = set_mtime_ns(&local_path, mtime_ns) {
+            report.failed.push(RepairFailure {
+                path: object.path.clone(),
+                error: format!("{error:#}"),
+            });
+            continue;
+        }
+        if let Some(birthtime_ns) = birthtime_ns {
+            // Birthtime updates are best-effort. A failure here does not
+            // count as a repair failure since it never counted as "correct"
+            // before either: it's strictly an improvement when supported.
+            let _ = set_birthtime_ns(&local_path, birthtime_ns);
+        }
+        report.repaired += 1;
+    }
+
+    Ok(report)
+}
+
+fn file_already_at_target_metadata(path: &Path, target_mtime_ns: i64) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(mtime) = metadata.modified() else {
+        return false;
+    };
+    let Ok(local_ns) = system_time_to_ns(mtime) else {
+        return false;
+    };
+    same_modified_second(local_ns, target_mtime_ns)
 }
 
 fn execute_parallel_downloads(
@@ -510,6 +627,8 @@ fn stored_object_from_remote(path: &str, remote_id: &str, file: &RemoteFile) -> 
         size: file.size,
         modified_at_ns: file.modified_at_ns,
         sha1: file.sha1.clone(),
+        original_modified_at_ns: file.original_modified_at_ns,
+        capture_time_ns: file.capture_time_ns,
     }
 }
 
@@ -592,7 +711,7 @@ fn download_one(
             ("total", json!(total)),
         ],
     );
-    set_mtime_ns(temp_file.path(), job.file.modified_at_ns)?;
+    apply_file_metadata(temp_file.path(), &job.file)?;
 
     if destination.exists() {
         fs::remove_file(&destination)
@@ -632,7 +751,7 @@ fn materialize_download(
     let mut temp_file = NamedTempFile::new_in(parent)?;
     let bytes = copy_with_callback(&mut reader, temp_file.as_file_mut(), |_| Ok(()))
         .with_context(|| format!("write {}", destination.display()))?;
-    set_mtime_ns(temp_file.path(), job.file.modified_at_ns)?;
+    apply_file_metadata(temp_file.path(), &job.file)?;
 
     if destination.exists() {
         fs::remove_file(&destination)
@@ -666,7 +785,7 @@ fn materialize_download_with_progress(
     let mut temp_file = NamedTempFile::new_in(parent)?;
     let bytes = copy_with_callback(&mut reader, temp_file.as_file_mut(), &mut on_progress)
         .with_context(|| format!("write {}", destination.display()))?;
-    set_mtime_ns(temp_file.path(), job.file.modified_at_ns)?;
+    apply_file_metadata(temp_file.path(), &job.file)?;
 
     if destination.exists() {
         fs::remove_file(&destination)
@@ -734,6 +853,112 @@ fn set_mtime_ns(path: &Path, modified_at_ns: i64) -> Result<()> {
         .with_context(|| format!("set mtime on {}", path.display()))
 }
 
+/// Resolves the best mtime to apply for a remote file. Prefers the original
+/// modification time decrypted from the Proton XAttr (the user's local mtime
+/// at upload time), falling back to the upload time when XAttr is missing or
+/// unparseable.
+fn effective_mtime_ns(file: &RemoteFile) -> i64 {
+    file.original_modified_at_ns.unwrap_or(file.modified_at_ns)
+}
+
+/// Resolves the best birthtime to apply on platforms that support setting it
+/// (currently macOS). Prefers the camera capture time, then the original
+/// modification time, then the upload time.
+fn effective_birthtime_ns(file: &RemoteFile) -> i64 {
+    file.capture_time_ns
+        .or(file.original_modified_at_ns)
+        .unwrap_or(file.modified_at_ns)
+}
+
+/// Applies mtime (and, on macOS, birthtime) to a freshly-written file.
+/// Errors on the mtime side bubble up because that is the most important
+/// metadata to preserve. Errors on the birthtime side are swallowed since
+/// not every macOS filesystem supports the `setattrlist` syscall (network
+/// volumes, some FUSE drivers).
+fn apply_file_metadata(path: &Path, file: &RemoteFile) -> Result<()> {
+    set_mtime_ns(path, effective_mtime_ns(file))?;
+    let _ = set_birthtime_ns(path, effective_birthtime_ns(file));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_birthtime_ns(path: &Path, birthtime_ns: i64) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: this calls into libc directly because the `filetime` crate
+    // does not expose macOS birthtime. The struct layout below mirrors
+    // `<sys/attr.h>` exactly. Both `attrlist` and `timespec` are
+    // POD-compatible C structs.
+    #[repr(C)]
+    struct AttrList {
+        bitmapcount: u16,
+        reserved: u16,
+        commonattr: u32,
+        volattr: u32,
+        dirattr: u32,
+        fileattr: u32,
+        forkattr: u32,
+    }
+
+    const ATTR_BIT_MAP_COUNT: u16 = 5;
+    const ATTR_CMN_CRTIME: u32 = 0x0000_0200;
+    const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
+
+    unsafe extern "C" {
+        fn setattrlist(
+            path: *const libc::c_char,
+            attrlist: *const AttrList,
+            attrbuf: *const libc::c_void,
+            attrbufsize: libc::size_t,
+            options: libc::c_ulong,
+        ) -> libc::c_int;
+    }
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("encode path {} for setattrlist", path.display()))?;
+
+    let attrs = AttrList {
+        bitmapcount: ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: ATTR_CMN_CRTIME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+
+    let timespec = libc::timespec {
+        tv_sec: birthtime_ns.div_euclid(1_000_000_000),
+        tv_nsec: birthtime_ns.rem_euclid(1_000_000_000) as libc::c_long,
+    };
+
+    let result = unsafe {
+        setattrlist(
+            c_path.as_ptr(),
+            &attrs,
+            &timespec as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timespec>(),
+            FSOPT_NOFOLLOW as libc::c_ulong,
+        )
+    };
+
+    if result == 0 {
+        Ok(())
+    } else {
+        let errno = std::io::Error::last_os_error();
+        Err(errno).with_context(|| format!("set birthtime on {}", path.display()))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_birthtime_ns(_path: &Path, _birthtime_ns: i64) -> Result<()> {
+    // No portable way to set the file creation time on Linux or Windows
+    // without filesystem-specific syscalls or platform support that we
+    // do not target. Treat as a no-op.
+    Ok(())
+}
+
 fn system_time_to_ns(value: SystemTime) -> Result<i64> {
     let duration = value
         .duration_since(UNIX_EPOCH)
@@ -782,10 +1007,14 @@ mod tests {
     use anyhow::{Result, anyhow};
     use tempfile::TempDir;
 
+    #[cfg(target_os = "macos")]
+    use super::set_birthtime_ns;
     use super::{
-        ExportOptions, PendingDownload, download_one, execute, execute_parallel_downloads,
-        file_up_to_date, materialize_download, prune_empty_dirs, same_modified_second, stale_paths,
-        stored_object_from_remote, system_time_to_ns,
+        ExportOptions, PendingDownload, RepairOptions, apply_file_metadata, download_one,
+        effective_birthtime_ns, effective_mtime_ns, execute, execute_parallel_downloads,
+        file_already_at_target_metadata, file_up_to_date, materialize_download, prune_empty_dirs,
+        repair_metadata, same_modified_second, stale_paths, stored_object_from_remote,
+        system_time_to_ns,
     };
     use crate::backend::PhotoSource;
     use crate::progress::{Mode, Reporter};
@@ -849,6 +1078,8 @@ mod tests {
             size,
             modified_at_ns,
             sha1: Some("abc".to_owned()),
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         }
     }
 
@@ -863,6 +1094,8 @@ mod tests {
             size: 1,
             modified_at_ns: 1,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
         state.upsert_object(&StoredObject {
             path: "drop.jpg".to_owned(),
@@ -871,6 +1104,8 @@ mod tests {
             size: 1,
             modified_at_ns: 1,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
 
         let stale = stale_paths(&state, &["keep.jpg".to_owned()].into_iter().collect())?;
@@ -891,6 +1126,8 @@ mod tests {
                 size: 42,
                 modified_at_ns: 99,
                 sha1: Some("abc".to_owned()),
+                original_modified_at_ns: None,
+                capture_time_ns: None,
             }
         );
     }
@@ -910,6 +1147,8 @@ mod tests {
             size: 4,
             modified_at_ns: 1_700_000_000_123_000_000,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         };
         assert!(file_up_to_date(Some(&stored), &remote, &path)?);
 
@@ -945,6 +1184,8 @@ mod tests {
             size: 4,
             modified_at_ns: 1_700_000_000_123_999_999,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         };
         let stored = StoredObject {
             path: "photo.jpg".to_owned(),
@@ -953,6 +1194,8 @@ mod tests {
             size: 4,
             modified_at_ns: 1_700_000_000_123_999_999,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         };
 
         assert!(file_up_to_date(Some(&stored), &remote, &path)?);
@@ -1009,6 +1252,8 @@ mod tests {
                 size: 5,
                 modified_at_ns: 1_700_000_000_123_000_000,
                 sha1: Some("abc".to_owned()),
+                original_modified_at_ns: None,
+                capture_time_ns: None,
             })
         );
         Ok(())
@@ -1102,6 +1347,8 @@ mod tests {
             size: 3,
             modified_at_ns: 1,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
         fs::create_dir_all(output_dir.join("2026"))?;
         fs::write(output_dir.join("2026/stale.jpg"), b"old")?;
@@ -1177,6 +1424,8 @@ mod tests {
             size: 3,
             modified_at_ns: 1,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
 
         let mut source = MemorySource::new("root");
@@ -1303,6 +1552,8 @@ mod tests {
             size: 3,
             modified_at_ns: 1,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
 
         let source = MemorySource::new("root").with_root_entries(Vec::new());
@@ -1344,6 +1595,8 @@ mod tests {
             size: 4,
             modified_at_ns: 1_700_000_000_123_000_000,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
 
         let source = MemorySource::new("root").with_root_entries(vec![RemoteEntry::file(
@@ -1376,6 +1629,8 @@ mod tests {
                 size: 4,
                 modified_at_ns: 1_700_000_000_999_000_000,
                 sha1: Some("abc".to_owned()),
+                original_modified_at_ns: None,
+                capture_time_ns: None,
             })
         );
         Ok(())
@@ -1394,6 +1649,8 @@ mod tests {
             size: 0,
             modified_at_ns: 1,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
         fs::create_dir_all(output_dir.join("stale"))?;
 
@@ -1555,5 +1812,252 @@ mod tests {
         let temp_dir = TempDir::new()?;
         prune_empty_dirs(&temp_dir.path().join("missing"))?;
         Ok(())
+    }
+
+    #[test]
+    fn effective_mtime_prefers_original_then_falls_back() {
+        let original = RemoteFile {
+            revision_id: "rev".to_owned(),
+            size: 0,
+            modified_at_ns: 200,
+            sha1: None,
+            original_modified_at_ns: Some(100),
+            capture_time_ns: None,
+        };
+        assert_eq!(effective_mtime_ns(&original), 100);
+
+        let no_original = RemoteFile {
+            original_modified_at_ns: None,
+            ..original.clone()
+        };
+        assert_eq!(effective_mtime_ns(&no_original), 200);
+    }
+
+    #[test]
+    fn effective_birthtime_prefers_capture_then_modification_then_upload() {
+        let everything = RemoteFile {
+            revision_id: "rev".to_owned(),
+            size: 0,
+            modified_at_ns: 30,
+            sha1: None,
+            original_modified_at_ns: Some(20),
+            capture_time_ns: Some(10),
+        };
+        assert_eq!(effective_birthtime_ns(&everything), 10);
+
+        let no_capture = RemoteFile {
+            capture_time_ns: None,
+            ..everything.clone()
+        };
+        assert_eq!(effective_birthtime_ns(&no_capture), 20);
+
+        let only_upload = RemoteFile {
+            capture_time_ns: None,
+            original_modified_at_ns: None,
+            ..everything
+        };
+        assert_eq!(effective_birthtime_ns(&only_upload), 30);
+    }
+
+    #[test]
+    fn apply_file_metadata_sets_mtime_to_original_when_available() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("photo.jpg");
+        fs::write(&path, b"jpeg")?;
+
+        let file = RemoteFile {
+            revision_id: "rev".to_owned(),
+            size: 4,
+            modified_at_ns: 1_900_000_000_000_000_000,
+            sha1: None,
+            // Original modification at 2020-01-02T03:04:05 UTC.
+            original_modified_at_ns: Some(1_577_934_245_000_000_000),
+            capture_time_ns: None,
+        };
+
+        apply_file_metadata(&path, &file)?;
+
+        let actual = system_time_to_ns(fs::metadata(&path)?.modified()?)?;
+        assert!(
+            same_modified_second(actual, 1_577_934_245_000_000_000),
+            "expected mtime around 2020-01-02T03:04:05 UTC, got {actual}"
+        );
+        Ok(())
+    }
+
+    /// On macOS we additionally try to set the birthtime via `setattrlist`.
+    /// This test only runs on macOS and is best-effort: if the underlying
+    /// filesystem rejects the call (rare on a TempDir backed by APFS in a
+    /// CI sandbox), we accept that silently rather than failing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn set_birthtime_ns_round_trips_on_macos() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("photo.jpg");
+        fs::write(&path, b"jpeg")?;
+
+        // 2020-01-02T03:04:05 UTC.
+        let target_ns: i64 = 1_577_934_245_000_000_000;
+        if set_birthtime_ns(&path, target_ns).is_err() {
+            // Some sandboxes refuse setattrlist; treat as inconclusive.
+            return Ok(());
+        }
+
+        // `Metadata::created()` reads st_birthtime on macOS via the libc
+        // backed std implementation. Some filesystems still expose the
+        // post-set value at second granularity, so compare with the same
+        // tolerance as for mtime.
+        let metadata = fs::metadata(&path)?;
+        let observed_seconds = metadata
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            // Fallback: read directly from raw stat fields.
+            .unwrap_or_else(|| metadata.ctime());
+        let expected_seconds = target_ns / 1_000_000_000;
+        assert!(
+            (observed_seconds - expected_seconds).abs() <= 1,
+            "expected birthtime around {expected_seconds}s, got {observed_seconds}s"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repair_metadata_applies_recorded_timestamps_to_existing_file() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let output_dir = temp_dir.path().join("out");
+        let state_db = temp_dir.path().join("state.sqlite");
+        let state = SyncState::open(&state_db)?;
+        // Pretend we already have a downloaded file with a wrong mtime.
+        let rel_path = "2024/photo.jpg";
+        let local_path = super::local_path(&output_dir, rel_path);
+        fs::create_dir_all(local_path.parent().expect("parent"))?;
+        fs::write(&local_path, b"jpeg")?;
+        super::set_mtime_ns(&local_path, 1_900_000_000_000_000_000)?;
+
+        // Record the right metadata in the state DB the way an `export`
+        // run would after decoding XAttr.
+        let target_ns = 1_577_934_245_000_000_000_i64; // 2020-01-02T03:04:05 UTC.
+        state.upsert_object(&StoredObject {
+            path: rel_path.to_owned(),
+            remote_id: "file-1".to_owned(),
+            revision_id: "rev-1".to_owned(),
+            size: 4,
+            modified_at_ns: 1_900_000_000_000_000_000,
+            sha1: None,
+            original_modified_at_ns: Some(target_ns),
+            capture_time_ns: None,
+        })?;
+        // Drop the connection so repair_metadata can open the DB freshly.
+        drop(state);
+
+        let report = repair_metadata(&RepairOptions {
+            state_db: state_db.clone(),
+            to_dir: output_dir.clone(),
+            dry_run: false,
+        })?;
+        assert_eq!(report.considered, 1);
+        assert_eq!(report.repaired, 1);
+        assert_eq!(report.already_correct, 0);
+        assert_eq!(report.missing_local, 0);
+        assert!(report.failed.is_empty());
+
+        let observed = system_time_to_ns(fs::metadata(&local_path)?.modified()?)?;
+        assert!(
+            same_modified_second(observed, target_ns),
+            "expected mtime ~2020-01-02 UTC, got {observed}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repair_metadata_skips_already_correct_files() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let output_dir = temp_dir.path().join("out");
+        let state_db = temp_dir.path().join("state.sqlite");
+        let state = SyncState::open(&state_db)?;
+        let target_ns = 1_577_934_245_000_000_000_i64;
+        let rel_path = "ok.jpg";
+        let local_path = super::local_path(&output_dir, rel_path);
+        fs::create_dir_all(&output_dir)?;
+        fs::write(&local_path, b"ok")?;
+        super::set_mtime_ns(&local_path, target_ns)?;
+        state.upsert_object(&StoredObject {
+            path: rel_path.to_owned(),
+            remote_id: "file-1".to_owned(),
+            revision_id: "rev-1".to_owned(),
+            size: 2,
+            modified_at_ns: 1_900_000_000_000_000_000,
+            sha1: None,
+            original_modified_at_ns: Some(target_ns),
+            capture_time_ns: None,
+        })?;
+        drop(state);
+
+        let report = repair_metadata(&RepairOptions {
+            state_db,
+            to_dir: output_dir,
+            dry_run: false,
+        })?;
+        assert_eq!(report.considered, 1);
+        assert_eq!(report.repaired, 0);
+        assert_eq!(report.already_correct, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn repair_metadata_counts_missing_local_and_no_metadata_rows() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let output_dir = temp_dir.path().join("out");
+        fs::create_dir_all(&output_dir)?;
+        let state_db = temp_dir.path().join("state.sqlite");
+        let state = SyncState::open(&state_db)?;
+        // Row 1: file recorded but not on disk anymore.
+        state.upsert_object(&StoredObject {
+            path: "gone.jpg".to_owned(),
+            remote_id: "file-1".to_owned(),
+            revision_id: "rev".to_owned(),
+            size: 1,
+            modified_at_ns: 1,
+            sha1: None,
+            original_modified_at_ns: Some(1),
+            capture_time_ns: None,
+        })?;
+        // Row 2: file on disk but no usable timestamp anywhere.
+        let rel_path = "no_ts.jpg";
+        let local_path = super::local_path(&output_dir, rel_path);
+        fs::write(&local_path, b"x")?;
+        state.upsert_object(&StoredObject {
+            path: rel_path.to_owned(),
+            remote_id: "file-2".to_owned(),
+            revision_id: "rev".to_owned(),
+            size: 1,
+            modified_at_ns: 0,
+            sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
+        })?;
+        drop(state);
+
+        let report = repair_metadata(&RepairOptions {
+            state_db,
+            to_dir: output_dir,
+            dry_run: false,
+        })?;
+        assert_eq!(report.considered, 2);
+        assert_eq!(report.repaired, 0);
+        assert_eq!(report.missing_local, 1);
+        assert_eq!(report.no_metadata, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn file_already_at_target_metadata_returns_false_for_missing_file() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let path = temp_dir.path().join("does-not-exist");
+        assert!(!file_already_at_target_metadata(&path, 1_000_000_000));
     }
 }

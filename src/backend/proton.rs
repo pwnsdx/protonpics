@@ -57,7 +57,7 @@ const HTTP_CONNECT_TIMEOUT_SECS: u64 = 15;
 const HTTP_API_TIMEOUT_SECS: u64 = 45;
 const HTTP_BLOCK_TIMEOUT_SECS: u64 = 60;
 const BLOCK_PREFETCH_DEPTH: usize = 2;
-const TREE_CACHE_VERSION: u32 = 1;
+const TREE_CACHE_VERSION: u32 = 2;
 const LINK_TYPE_FOLDER: i32 = 1;
 const LINK_TYPE_FILE: i32 = 2;
 const LINK_TYPE_ALBUM: i32 = 3;
@@ -622,6 +622,8 @@ struct ApiShareChildLink {
     node_passphrase: String,
     #[serde(default)]
     file_properties: Option<ApiShareFileProperties>,
+    #[serde(rename = "XAttr", default)]
+    xattr: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -792,6 +794,8 @@ struct ApiLink {
     node_passphrase: String,
     #[serde(default)]
     file_properties: Option<ApiFileProperties>,
+    #[serde(rename = "XAttr", default)]
+    xattr: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -819,6 +823,8 @@ struct ApiLinkRecord {
     node_passphrase: String,
     #[serde(rename = "Size", default)]
     size: Option<i64>,
+    #[serde(rename = "XAttr", default)]
+    xattr: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3615,6 +3621,7 @@ impl ApiLinkDetail {
             node_key: self.link.node_key,
             node_passphrase: self.link.node_passphrase,
             file_properties,
+            xattr: self.link.xattr,
         })
     }
 }
@@ -3657,6 +3664,7 @@ impl ApiShareChildLink {
             file_properties: self
                 .file_properties
                 .and_then(|file| file.into_file_properties()),
+            xattr: self.xattr,
         }
     }
 }
@@ -4093,11 +4101,14 @@ fn scan_folder(shared: &ConcurrentTreeLoadState, task: FolderScanTask) -> Result
                     .ok_or_else(|| anyhow!("file {} missing file properties", child.link_id))?;
                 let child_keys = decrypt_node_keys(task.folder_keys.as_ref(), &child)
                     .with_context(|| format!("decrypt file node keys {}", child.link_id))?;
+                let xattr_parsed = decrypt_xattr_for_link(&child, &child_keys);
                 let file = RemoteFile {
                     revision_id: file_properties.active_revision.id.clone(),
                     size: child.size,
                     modified_at_ns: child.modify_time.saturating_mul(1_000_000_000),
-                    sha1: None,
+                    sha1: xattr_parsed.sha1.clone(),
+                    original_modified_at_ns: xattr_parsed.modification_time_ns,
+                    capture_time_ns: xattr_parsed.capture_time_ns,
                 };
                 files.push((
                     child.link_id.clone(),
@@ -4393,6 +4404,217 @@ fn normalize_photo_share_name(name: &str) -> String {
     }
 }
 
+/// Parsed view of a Proton XAttr blob, narrowed to the metadata we care
+/// about restoring to the local filesystem. See the official schema at
+/// `proton-sdk/js/sdk/src/internal/nodes/extendedAttributes.ts` and at
+/// `ProtonMail-WebClients/applications/drive/src/app/store/_links/extendedAttributes.ts`.
+#[derive(Debug, Default, Clone)]
+struct ParsedXAttr {
+    /// `Common.ModificationTime` translated to nanoseconds since the unix
+    /// epoch. This is the user's original local mtime at upload time.
+    modification_time_ns: Option<i64>,
+    /// `Camera.CaptureTime` translated to nanoseconds since the unix epoch.
+    /// Only present when the file is a photo or a video that carried EXIF
+    /// or container-level timing info at upload time.
+    capture_time_ns: Option<i64>,
+    /// `Common.Digests.SHA1`, lowercased to match Proton's other clients.
+    sha1: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XAttrEnvelope {
+    #[serde(default, rename = "Common")]
+    common: Option<XAttrCommon>,
+    #[serde(default, rename = "Camera")]
+    camera: Option<XAttrCamera>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XAttrCommon {
+    #[serde(default, rename = "ModificationTime")]
+    modification_time: Option<String>,
+    #[serde(default, rename = "Digests")]
+    digests: Option<XAttrDigests>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XAttrDigests {
+    #[serde(default, rename = "SHA1")]
+    sha1: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XAttrCamera {
+    #[serde(default, rename = "CaptureTime")]
+    capture_time: Option<String>,
+}
+
+/// Best-effort decryption and parsing of a link's XAttr blob. Returns an
+/// empty `ParsedXAttr` whenever anything goes wrong: the goal is to enrich
+/// metadata when we can, never to fail the scan.
+///
+/// Note: signature verification is intentionally skipped here. Adding it
+/// would require fetching and unlocking the address public keys for every
+/// file's `SignatureEmail`, which is well beyond the value of XAttr metadata
+/// for a one-way export tool. The XAttr is decrypted with the file's own
+/// node key, which an attacker without the user's password cannot produce.
+fn decrypt_xattr_for_link(link: &ApiLink, node_keys: &SecretKeyRing) -> ParsedXAttr {
+    let Some(armored) = link.xattr.as_deref() else {
+        return ParsedXAttr::default();
+    };
+    let trimmed = armored.trim();
+    if trimmed.is_empty() {
+        return ParsedXAttr::default();
+    }
+
+    let plaintext = match decrypt_text(node_keys, trimmed) {
+        Ok(text) => text,
+        Err(_) => return ParsedXAttr::default(),
+    };
+
+    parse_xattr_payload(&plaintext)
+}
+
+fn parse_xattr_payload(plaintext: &str) -> ParsedXAttr {
+    let envelope: XAttrEnvelope = match serde_json::from_str(plaintext) {
+        Ok(parsed) => parsed,
+        Err(_) => return ParsedXAttr::default(),
+    };
+
+    let modification_time_ns = envelope
+        .common
+        .as_ref()
+        .and_then(|common| common.modification_time.as_deref())
+        .and_then(parse_iso8601_to_ns);
+    let capture_time_ns = envelope
+        .camera
+        .as_ref()
+        .and_then(|camera| camera.capture_time.as_deref())
+        .and_then(parse_iso8601_to_ns);
+    let sha1 = envelope
+        .common
+        .and_then(|common| common.digests)
+        .and_then(|digests| digests.sha1)
+        .map(|raw| raw.trim().to_ascii_lowercase())
+        .filter(|hex| !hex.is_empty());
+
+    ParsedXAttr {
+        modification_time_ns,
+        capture_time_ns,
+        sha1,
+    }
+}
+
+/// Parses an ISO 8601 timestamp returned by Proton XAttr blobs. Accepts
+/// the canonical `2024-08-15T14:32:00.000Z`, the legacy `+0000` form
+/// (older Proton clients), `+HH:MM` offsets, and missing fractional
+/// seconds. Returns nanoseconds since the unix epoch.
+fn parse_iso8601_to_ns(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+
+    // Position 4, 7 must be '-', position 10 must be 'T' (or space, some
+    // clients emit a space), positions 13 and 16 must be ':'.
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || (bytes[10] != b'T' && bytes[10] != b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+
+    let year: i32 = trimmed[0..4].parse().ok()?;
+    let month: u32 = trimmed[5..7].parse().ok()?;
+    let day: u32 = trimmed[8..10].parse().ok()?;
+    let hour: u32 = trimmed[11..13].parse().ok()?;
+    let minute: u32 = trimmed[14..16].parse().ok()?;
+    let second: u32 = trimmed[17..19].parse().ok()?;
+
+    // Optional fractional seconds and timezone, e.g. ".123Z" or "+02:00".
+    let mut cursor = 19;
+    let mut fractional_ns: u32 = 0;
+    if cursor < bytes.len() && bytes[cursor] == b'.' {
+        cursor += 1;
+        let frac_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        let frac = &trimmed[frac_start..cursor];
+        if frac.is_empty() {
+            return None;
+        }
+        // Pad or truncate to 9 digits to align with nanoseconds.
+        let mut padded = String::with_capacity(9);
+        for ch in frac.chars().take(9) {
+            padded.push(ch);
+        }
+        while padded.len() < 9 {
+            padded.push('0');
+        }
+        fractional_ns = padded.parse().ok()?;
+    }
+
+    let tz_offset_seconds: i64 = if cursor >= bytes.len() {
+        // No timezone designator. Older Proton clients sometimes omit the
+        // `Z`; treat it as UTC for safety since Proton normalizes to UTC.
+        0
+    } else {
+        match bytes[cursor] {
+            b'Z' | b'z' => 0,
+            b'+' | b'-' => {
+                let sign: i64 = if bytes[cursor] == b'-' { -1 } else { 1 };
+                cursor += 1;
+                let remaining = &trimmed[cursor..];
+                let (h, m): (i64, i64) = if remaining.len() >= 5 && &remaining[2..3] == ":" {
+                    let h: i64 = remaining[0..2].parse().ok()?;
+                    let m: i64 = remaining[3..5].parse().ok()?;
+                    (h, m)
+                } else if remaining.len() >= 4 {
+                    let h: i64 = remaining[0..2].parse().ok()?;
+                    let m: i64 = remaining[2..4].parse().ok()?;
+                    (h, m)
+                } else {
+                    return None;
+                };
+                sign * (h * 3600 + m * 60)
+            }
+            _ => return None,
+        }
+    };
+
+    let utc_seconds = days_from_civil(year, month, day)?
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second))?
+        .checked_sub(tz_offset_seconds)?;
+
+    let nanos = utc_seconds.checked_mul(1_000_000_000)?;
+    nanos.checked_add(i64::from(fractional_ns))
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date, using Howard
+/// Hinnant's `days_from_civil` algorithm. Returns `None` if the date is
+/// invalid.
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || day == 0 || day > 31 {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = (y - era * 400) as u32;
+    let m = month as i32;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day as i32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u32;
+    Some(i64::from(era) * 146_097 + i64::from(doe) - 719_468)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
@@ -4437,15 +4659,16 @@ mod tests {
         empty_credentials, find_share_by_name, from_args, handle_human_verification_connection,
         hash_password, human_verification_proxy_base_url, inferred_session_email, list_shares,
         list_shares_with_api, load_tree, login, login_with_api, mailbox_password,
-        parse_human_verification_challenge, parse_retry_after_seconds, parse_signed_modulus,
-        parse_signed_modulus as parse_modulus, resolve_login_command, retry_delay_for_attempt,
-        save_tree_cache, select_session, select_share, share_display_base, share_flags_label,
-        share_state_label, share_type_label, start_block_prefetch, tree_cache_matches,
-        try_load_cached_backend, unlock_key_records, validate_srp_params, verify_block_hash,
-        with_test_accounts_dir, with_test_api_base_url, with_test_browser_behavior,
-        with_test_default_account_root, with_test_human_verification_answer,
-        with_test_prompt_confirm, with_test_prompt_secrets, with_test_prompt_selection,
-        with_test_prompt_texts, with_test_srp_client_secret, write_human_verification_response,
+        parse_human_verification_challenge, parse_iso8601_to_ns, parse_retry_after_seconds,
+        parse_signed_modulus, parse_signed_modulus as parse_modulus, parse_xattr_payload,
+        resolve_login_command, retry_delay_for_attempt, save_tree_cache, select_session,
+        select_share, share_display_base, share_flags_label, share_state_label, share_type_label,
+        start_block_prefetch, tree_cache_matches, try_load_cached_backend, unlock_key_records,
+        validate_srp_params, verify_block_hash, with_test_accounts_dir, with_test_api_base_url,
+        with_test_browser_behavior, with_test_default_account_root,
+        with_test_human_verification_answer, with_test_prompt_confirm, with_test_prompt_secrets,
+        with_test_prompt_selection, with_test_prompt_texts, with_test_srp_client_secret,
+        write_human_verification_response,
     };
     use crate::accounts;
     use crate::backend::PhotoSource;
@@ -4898,6 +5121,8 @@ mod tests {
                         size: 42,
                         modified_at_ns: 99,
                         sha1: None,
+                        original_modified_at_ns: None,
+                        capture_time_ns: None,
                     },
                 )],
             )]),
@@ -4919,6 +5144,7 @@ mod tests {
                                 id: "rev-1".to_owned(),
                             },
                         }),
+                        xattr: None,
                     },
                     node_keys: Arc::new(SecretKeyRing::from_armored_secret(&secret_armored, b"")?),
                 },
@@ -6861,6 +7087,8 @@ mod tests {
                             size: 4,
                             modified_at_ns: 1,
                             sha1: None,
+                            original_modified_at_ns: None,
+                            capture_time_ns: None,
                         },
                     ),
                 ],
@@ -7657,6 +7885,7 @@ mod tests {
                     node_key: String::new(),
                     node_passphrase: String::new(),
                     file_properties: None,
+                    xattr: None,
                 },
                 node_keys: Arc::new(SecretKeyRing { keys: Vec::new() }),
             },
@@ -8915,5 +9144,79 @@ mod tests {
             Some("en-US,en;q=0.9")
         );
         Ok(())
+    }
+
+    #[test]
+    fn parse_iso8601_handles_canonical_and_legacy_formats() {
+        // Canonical RFC 3339 / ISO 8601 with milliseconds and `Z`.
+        let canonical = parse_iso8601_to_ns("2024-08-15T14:32:00.123Z").expect("canonical");
+        // 2024-08-15T14:32:00 UTC = 1_723_732_320 seconds since epoch.
+        assert_eq!(canonical, 1_723_732_320 * 1_000_000_000 + 123_000_000);
+
+        // Legacy `+0000` form emitted by older Proton clients.
+        let legacy = parse_iso8601_to_ns("2009-02-13T23:31:30+0000").expect("legacy");
+        assert_eq!(legacy, 1_234_567_890 * 1_000_000_000);
+
+        // `+HH:MM` offset.
+        let offset = parse_iso8601_to_ns("2024-08-15T16:32:00+02:00").expect("offset");
+        assert_eq!(offset, 1_723_732_320 * 1_000_000_000);
+
+        // No timezone designator: treated as UTC.
+        let bare = parse_iso8601_to_ns("2024-08-15T14:32:00").expect("bare");
+        assert_eq!(bare, 1_723_732_320 * 1_000_000_000);
+
+        // Sub-second precision: 9-digit nanosecond expansion.
+        let nanos = parse_iso8601_to_ns("2024-08-15T14:32:00.000000789Z").expect("nanos");
+        assert_eq!(nanos, 1_723_732_320 * 1_000_000_000 + 789);
+
+        // Garbage input rejects gracefully.
+        assert!(parse_iso8601_to_ns("not a timestamp").is_none());
+        assert!(parse_iso8601_to_ns("").is_none());
+        assert!(parse_iso8601_to_ns("2024-13-01T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn parse_xattr_payload_extracts_common_and_camera_fields() {
+        let payload = r#"{
+            "Common": {
+                "ModificationTime": "2024-08-15T14:32:00.000Z",
+                "Size": 1234,
+                "Digests": { "SHA1": "ABCDEF1234567890" }
+            },
+            "Camera": {
+                "CaptureTime": "2020-01-02T03:04:05Z",
+                "Device": "iPhone"
+            }
+        }"#;
+        let parsed = parse_xattr_payload(payload);
+        assert_eq!(
+            parsed.modification_time_ns,
+            Some(1_723_732_320 * 1_000_000_000)
+        );
+        assert_eq!(parsed.capture_time_ns, Some(1_577_934_245 * 1_000_000_000));
+        assert_eq!(parsed.sha1.as_deref(), Some("abcdef1234567890"));
+    }
+
+    #[test]
+    fn parse_xattr_payload_tolerates_partial_and_malformed_input() {
+        // Missing fields should produce None silently.
+        let only_common = parse_xattr_payload(r#"{"Common": {}}"#);
+        assert!(only_common.modification_time_ns.is_none());
+        assert!(only_common.capture_time_ns.is_none());
+        assert!(only_common.sha1.is_none());
+
+        // Garbage timestamp should be ignored, but parsing must not panic.
+        let bad_time = parse_xattr_payload(
+            r#"{"Common": {"ModificationTime": "yesterday", "Digests": {"SHA1": ""}}}"#,
+        );
+        assert!(bad_time.modification_time_ns.is_none());
+        // Empty SHA1 is filtered out so callers do not record empty strings.
+        assert!(bad_time.sha1.is_none());
+
+        // Outright invalid JSON returns the default ParsedXAttr.
+        let invalid = parse_xattr_payload("not json");
+        assert!(invalid.modification_time_ns.is_none());
+        assert!(invalid.capture_time_ns.is_none());
+        assert!(invalid.sha1.is_none());
     }
 }

@@ -22,6 +22,7 @@ pub enum Command {
     Login(LoginCommand),
     Shares(SharesCommand),
     State(StateCommand),
+    RepairMetadata(RepairMetadataCommand),
 }
 
 #[derive(Debug, Args)]
@@ -180,6 +181,28 @@ pub struct SharesCommand {
 pub struct StateCommand {
     #[arg(long, value_name = "FILE")]
     pub state_db: PathBuf,
+}
+
+/// Re-applies original mtime and (on macOS) birthtime to files already on
+/// disk, using metadata recorded in the SQLite state DB. Useful after
+/// upgrading from a previous version that did not yet decrypt Proton
+/// XAttr blobs: run `export` once to backfill the state DB, then run
+/// this command to fix the on-disk timestamps without re-downloading.
+#[derive(Debug, Args)]
+pub struct RepairMetadataCommand {
+    /// Local export root passed to a previous `export` run. Files are
+    /// resolved relative to this directory.
+    #[arg(long, value_name = "DIR")]
+    pub to: PathBuf,
+
+    /// Path to the SQLite state DB. Defaults to looking next to the
+    /// session file when omitted, just like `export`.
+    #[arg(long, value_name = "FILE")]
+    pub state_db: Option<PathBuf>,
+
+    /// Show what would change without touching any file.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[cfg(test)]

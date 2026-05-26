@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const INIT_SQL: &str = r#"
             CREATE TABLE IF NOT EXISTS sync_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -22,7 +22,9 @@ const INIT_SQL: &str = r#"
                 size INTEGER NOT NULL DEFAULT 0,
                 modified_at_ns INTEGER NOT NULL DEFAULT 0,
                 sha1 TEXT,
-                downloaded_unix INTEGER
+                downloaded_unix INTEGER,
+                original_modified_at_ns INTEGER,
+                capture_time_ns INTEGER
             );
             "#;
 const INSERT_STATE_SQL: &str =
@@ -30,15 +32,17 @@ const INSERT_STATE_SQL: &str =
 const UPDATE_STATE_SQL: &str =
     "UPDATE sync_state SET backend_name = ?, root_id = ?, updated_unix = ? WHERE id = 1";
 const UPSERT_OBJECT_SQL: &str = r#"
-            INSERT INTO objects (path, remote_id, revision_id, size, modified_at_ns, sha1, downloaded_unix)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO objects (path, remote_id, revision_id, size, modified_at_ns, sha1, downloaded_unix, original_modified_at_ns, capture_time_ns)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 remote_id = excluded.remote_id,
                 revision_id = excluded.revision_id,
                 size = excluded.size,
                 modified_at_ns = excluded.modified_at_ns,
                 sha1 = excluded.sha1,
-                downloaded_unix = excluded.downloaded_unix
+                downloaded_unix = excluded.downloaded_unix,
+                original_modified_at_ns = excluded.original_modified_at_ns,
+                capture_time_ns = excluded.capture_time_ns
             "#;
 const SUMMARY_SQL: &str = "SELECT backend_name, root_id, updated_unix FROM sync_state WHERE id = 1";
 
@@ -50,6 +54,8 @@ pub struct StoredObject {
     pub size: i64,
     pub modified_at_ns: i64,
     pub sha1: Option<String>,
+    pub original_modified_at_ns: Option<i64>,
+    pub capture_time_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,8 +105,13 @@ impl SyncState {
             .optional()?;
 
         match version {
-            Some(value) if value != SCHEMA_VERSION => {
-                bail!("state DB schema_version {value} != expected {SCHEMA_VERSION}");
+            Some(value) if value > SCHEMA_VERSION => {
+                bail!(
+                    "state DB schema_version {value} is newer than supported {SCHEMA_VERSION}; downgrade is not safe"
+                );
+            }
+            Some(value) if value < SCHEMA_VERSION => {
+                migrate_to_current(&connection, value)?;
             }
             Some(_) => {}
             None => {
@@ -122,7 +133,7 @@ impl SyncState {
     pub fn get_object(&self, path: &str) -> Result<Option<StoredObject>> {
         self.connection
             .query_row(
-                "SELECT path, remote_id, revision_id, size, modified_at_ns, sha1 FROM objects WHERE path = ?",
+                "SELECT path, remote_id, revision_id, size, modified_at_ns, sha1, original_modified_at_ns, capture_time_ns FROM objects WHERE path = ?",
                 [path],
                 |row| {
                     Ok(StoredObject {
@@ -132,6 +143,8 @@ impl SyncState {
                         size: row.get(3)?,
                         modified_at_ns: row.get(4)?,
                         sha1: row.get(5)?,
+                        original_modified_at_ns: row.get(6)?,
+                        capture_time_ns: row.get(7)?,
                     })
                 },
             )
@@ -147,10 +160,36 @@ impl SyncState {
             object.size,
             object.modified_at_ns,
             object.sha1,
-            now_unix()?
+            now_unix()?,
+            object.original_modified_at_ns,
+            object.capture_time_ns,
         ];
         self.connection.execute(UPSERT_OBJECT_SQL, params)?;
         Ok(())
+    }
+
+    /// Iterate over every stored object, useful for repair-style commands.
+    pub fn list_objects(&self) -> Result<Vec<StoredObject>> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, remote_id, revision_id, size, modified_at_ns, sha1, original_modified_at_ns, capture_time_ns FROM objects",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(StoredObject {
+                path: row.get(0)?,
+                remote_id: row.get(1)?,
+                revision_id: row.get(2)?,
+                size: row.get(3)?,
+                modified_at_ns: row.get(4)?,
+                sha1: row.get(5)?,
+                original_modified_at_ns: row.get(6)?,
+                capture_time_ns: row.get(7)?,
+            })
+        })?;
+        let mut objects = Vec::new();
+        for row in rows {
+            objects.push(row?);
+        }
+        Ok(objects)
     }
 
     pub fn list_object_paths(&self) -> Result<Vec<String>> {
@@ -195,6 +234,50 @@ fn now_unix() -> Result<i64> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| anyhow!("system clock before unix epoch: {error}"))?;
     i64::try_from(duration.as_secs()).context("unix seconds overflow")
+}
+
+/// Apply forward-only migrations that bring the schema from `from_version`
+/// up to `SCHEMA_VERSION`. The function is idempotent and tolerant of
+/// columns that already exist (which can happen when `INIT_SQL` has just
+/// added them via `CREATE TABLE IF NOT EXISTS` on an empty database).
+fn migrate_to_current(connection: &Connection, from_version: i64) -> Result<()> {
+    if from_version < 2 {
+        // 0.1.2 added two nullable columns to `objects` to track the
+        // original modification time and original capture time decrypted
+        // from the Proton XAttr blob. Both default to NULL so existing
+        // rows simply lose access to the new fields until the next sync
+        // refills them.
+        add_column_if_missing(connection, "objects", "original_modified_at_ns", "INTEGER")?;
+        add_column_if_missing(connection, "objects", "capture_time_ns", "INTEGER")?;
+    }
+    connection.execute(
+        "UPDATE sync_state SET schema_version = ?, updated_unix = ? WHERE id = 1",
+        params![SCHEMA_VERSION, now_unix()?],
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    sql_type: &str,
+) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+    connection
+        .execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}"),
+            [],
+        )
+        .with_context(|| format!("add column {column} to {table}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -280,6 +363,8 @@ mod tests {
             size: 42,
             modified_at_ns: 1700000000000000000,
             sha1: Some("abc".to_owned()),
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         };
         state.upsert_object(&object)?;
         assert_eq!(state.get_object(&object.path)?, Some(object.clone()));
@@ -323,6 +408,8 @@ mod tests {
             size: 1,
             modified_at_ns: 1,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
         state.upsert_object(&StoredObject {
             path: path.to_owned(),
@@ -331,6 +418,8 @@ mod tests {
             size: 2,
             modified_at_ns: 2,
             sha1: Some("abc".to_owned()),
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
 
         assert_eq!(
@@ -342,6 +431,8 @@ mod tests {
                 size: 2,
                 modified_at_ns: 2,
                 sha1: Some("abc".to_owned()),
+                original_modified_at_ns: None,
+                capture_time_ns: None,
             })
         );
         Ok(())
@@ -369,6 +460,8 @@ mod tests {
             size: 1,
             modified_at_ns: 1,
             sha1: None,
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
         state.upsert_object(&StoredObject {
             path: "a/photo.jpg".to_owned(),
@@ -377,6 +470,8 @@ mod tests {
             size: 2,
             modified_at_ns: 2,
             sha1: Some("abc".to_owned()),
+            original_modified_at_ns: None,
+            capture_time_ns: None,
         })?;
 
         let mut paths = state.list_object_paths()?;

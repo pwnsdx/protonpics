@@ -15,9 +15,8 @@ use anyhow::Result;
 
 use crate::backend::proton::{LoginOutput, ShareInfo};
 use crate::cli::{Cli, Command, LoginCommand, ProgressMode, SharesCommand};
-use crate::export::ExportOptions;
+use crate::export::{ExportOptions, RepairOptions};
 use crate::progress::Mode as ProgressOutputMode;
-
 pub fn run(cli: Cli) -> Result<i32> {
     let mut stdout = io::stdout();
     run_with_writer(
@@ -127,6 +126,77 @@ where
             writeln!(out, "objects={}", summary.object_count)?;
             writeln!(out, "updated_unix={updated_unix}")?;
             Ok(0)
+        }
+        Command::RepairMetadata(command) => {
+            let state_db = match command.state_db {
+                Some(path) => path,
+                None => default_state_db_for_repair()?,
+            };
+            let options = RepairOptions {
+                state_db,
+                to_dir: command.to,
+                dry_run: command.dry_run,
+            };
+            let report = export::repair_metadata(&options)?;
+            let mode_label = if options.dry_run {
+                "repair-metadata-dry"
+            } else {
+                "repair-metadata"
+            };
+            writeln!(
+                out,
+                "{mode_label} considered={} repaired={} already_correct={} missing_local={} no_metadata={} failed={}",
+                report.considered,
+                report.repaired,
+                report.already_correct,
+                report.missing_local,
+                report.no_metadata,
+                report.failed.len(),
+            )?;
+            if !report.failed.is_empty() {
+                writeln!(
+                    out,
+                    "{} file(s) could not be repaired:",
+                    report.failed.len()
+                )?;
+                for failure in report.failed.iter().take(20) {
+                    writeln!(out, "  failed: {} -- {}", failure.path, failure.error)?;
+                }
+                if report.failed.len() > 20 {
+                    writeln!(out, "  ... and {} more", report.failed.len() - 20)?;
+                }
+                Ok(2)
+            } else {
+                Ok(0)
+            }
+        }
+    }
+}
+
+/// Resolves the state DB path when `repair-metadata` is invoked without an
+/// explicit `--state-db`. We never want to start a Proton backend just to
+/// learn this path, so we replicate the export-time convention by hand:
+/// `<cwd>/<email>/proton-photos.sqlite` for the lone account in the cwd.
+fn default_state_db_for_repair() -> Result<std::path::PathBuf> {
+    let dir = paths::default_accounts_dir()?;
+    let stored = accounts::list_accounts(&dir)?;
+    match stored.len() {
+        0 => Err(anyhow::anyhow!(
+            "no Proton account found in {}; pass --state-db explicitly",
+            dir.display()
+        )),
+        1 => {
+            let account = &stored[0];
+            let parent = account.path.parent().unwrap_or(std::path::Path::new("."));
+            Ok(parent.join("proton-photos.sqlite"))
+        }
+        _ => {
+            let names: Vec<_> = stored.iter().map(|a| a.email.as_str()).collect();
+            Err(anyhow::anyhow!(
+                "multiple Proton accounts found in {} ({}); pass --state-db explicitly",
+                dir.display(),
+                names.join(", ")
+            ))
         }
     }
 }

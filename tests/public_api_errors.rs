@@ -71,6 +71,8 @@ impl protonpics::backend::PhotoSource for SingleFileSource {
                     size: 4,
                     modified_at_ns: 1,
                     sha1: None,
+                    original_modified_at_ns: None,
+                    capture_time_ns: None,
                 },
             )])
         } else {

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.2 - 2026-05-26
+
+Restores original photo timestamps. Files exported from Proton Photos used to land on disk with the upload timestamp, not the timestamp the user actually had locally before uploading. This release fixes that.
+
+### Changed
+
+- **`export` now restores the original modification time on every downloaded file.** The original mtime is read from the encrypted XAttr blob attached to each Proton link (`Common.ModificationTime`), decrypted with the file's own node key, and applied at write time. When the XAttr is missing or unreadable for any reason (e.g. files uploaded by very old clients), the upload time is used as a fallback so the export never regresses to a worse state.
+- **macOS only: birthtime is also restored.** The OS-level "creation time" is set via `setattrlist` from `Camera.CaptureTime` when present, falling back to `Common.ModificationTime` and finally the upload time. Linux and Windows have no portable equivalent, so the call is a no-op there.
+- **State DB schema bumped to v2.** Two new nullable columns track the restored timestamps so reruns can stay fast even when the XAttr decode fails on a particular file. Existing v1 databases are migrated forward in place; older versions of the tool will refuse to open a v2 DB on purpose.
+- **Tree cache version bumped to v2.** Caches written by 0.1.1 or earlier are silently rejected and rebuilt on the first run.
+
+### Added
+
+- New `repair-metadata` subcommand. Use it after upgrading: run `protonpics export ...` once to backfill the new state-DB columns, then `protonpics repair-metadata --to ./photos` to retroactively fix every existing local file's mtime and birthtime without re-downloading. Supports `--dry-run`.
+
 ## 0.1.1 - 2026-05-25
 
 Resilience release. The project was also renamed from `proton-photos-export` to `protonpics`.

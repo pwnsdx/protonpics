@@ -176,6 +176,8 @@ fn public_run_execute_and_state_apis_work_end_to_end() -> Result<()> {
         size: 1,
         modified_at_ns: 1,
         sha1: None,
+        original_modified_at_ns: None,
+        capture_time_ns: None,
     })?;
     assert_eq!(state.list_object_paths()?.len(), 2);
 
@@ -184,6 +186,8 @@ fn public_run_execute_and_state_apis_work_end_to_end() -> Result<()> {
         size: 4,
         modified_at_ns: 1,
         sha1: None,
+        original_modified_at_ns: None,
+        capture_time_ns: None,
     };
     let entry = RemoteEntry::file("file-2", "other.jpg", file);
     assert_eq!(entry.id, "file-2");

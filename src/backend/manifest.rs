@@ -151,6 +151,8 @@ fn index_children(
                         size,
                         modified_at_ns,
                         sha1,
+                        original_modified_at_ns: None,
+                        capture_time_ns: None,
                     },
                 ));
             }
